@@ -508,11 +508,11 @@ def train_model(state: train_state.TrainState, dataset_train: tf.data.Dataset, p
 
             loss_accumulate = metrics.Average.merge(self=loss_accumulate, other=metrics.Average.from_model_output(values=loss))
 
-        aim_run.track(value=loss_accumulate.compute(), name='Loss')
+        aim_run.track(value=loss_accumulate.compute(), name='Loss', context={'model': state.model_id})
 
         # region EVALUATION
         acc = evaluate(state=state, args=args)
-        aim_run.track(value=acc, name='Accuracy')
+        aim_run.track(value=acc, name='Accuracy', context={'model': state.model_id})
         # endregion
 
     return state
@@ -523,6 +523,7 @@ class TrainState(train_state.TrainState):
     """
     batch_stats: Any
     model: nn.Module
+    model_id: int
 
 
 def main() -> None:
@@ -588,8 +589,8 @@ def main() -> None:
     log_mult_prob_1 = 10 * log_mult_prob_1 + np.random.rand(*log_mult_prob_1.shape)
     log_mult_prob_1 = jax.nn.log_softmax(x=log_mult_prob_1, axis=-1)
 
-    # log_p_y_2 = log_p_y_1 + 0.
-    # log_mult_prob_2 = log_mult_prob_1 + 0.
+    log_p_y_2 = log_p_y_1 + 0.
+    log_mult_prob_2 = log_mult_prob_1 + 0.
 
     del current_index
     del batch_size_
@@ -601,23 +602,33 @@ def main() -> None:
     # region MODEL
     model = ResNet18(num_classes=len(ds_builder.info.features['label'].names))
 
-    key1, key2 = jax.random.split(jax.random.PRNGKey(0))
-    x = jax.random.normal(key1, (5, 32, 32, 3))  # Dummy input data
-    params = model.init(rngs=key2, x=x, train=False)
-
     lr_schedule_fn = optax.cosine_decay_schedule(
         init_value=args.lr,
         decay_steps=500*args.num_epochs
     )
-    tx = optax.sgd(learning_rate=lr_schedule_fn, momentum=0.9)  # define an optimizer
 
-    state_1 = TrainState.create(
-        apply_fn=model.apply,
-        params=params['params'],
-        batch_stats=params['batch_stats'],
-        model=model,
-        tx=tx
-    )
+    def initialize_train_state(model_id: int) -> train_state.TrainState:
+        key1, key2 = jax.random.split(
+            key=jax.random.PRNGKey(random.randint(a=0, b=1_000)),
+            num=2
+        )
+        x = jax.random.normal(key1, (1, 32, 32, 3))  # Dummy input data
+        params = model.init(rngs=key2, x=x, train=False)
+        tx = optax.sgd(learning_rate=lr_schedule_fn, momentum=0.9)  # define an optimizer
+
+        state = TrainState.create(
+            apply_fn=model.apply,
+            params=params['params'],
+            batch_stats=params['batch_stats'],
+            model=model,
+            model_id=model_id,
+            tx=tx
+        )
+
+        return state
+
+    state_1 = initialize_train_state(model_id=1)
+    state_2 = initialize_train_state(model_id=2)
     # endregion
 
     # region EXPERIMENT TRACKING
@@ -643,79 +654,97 @@ def main() -> None:
     # endregion
 
     # # region WARM-UP
-    state_1 = train_model(
-        state=state_1,
-        dataset_train=dataset_train,
-        p_y=jnp.exp(log_p_y_1),
-        num_epochs=args.num_warmup,
-        aim_run=aim_run,
-        args=args
-    )
+    for state_ in [state_1, state_2]:
+        state_ = train_model(
+            state=state_,
+            dataset_train=dataset_train,
+            p_y=jnp.exp(log_p_y_1),
+            num_epochs=args.num_warmup,
+            aim_run=aim_run,
+            args=args
+        )
     # # endregion
 
     # define data-loaders to create sample indices
-    index_loader_1 = tf.data.Dataset.range(args.total_num_samples)
-    index_loader_1 = index_loader_1.shuffle(buffer_size=args.total_num_samples, reshuffle_each_iteration=True)
-    index_loader_1 = index_loader_1.batch(batch_size=args.num_samples)
+    def create_index_loader() -> tf.data.Dataset:
+        index_loader = tf.data.Dataset.range(args.total_num_samples)
+        index_loader = index_loader.shuffle(buffer_size=args.total_num_samples, reshuffle_each_iteration=True)
+        index_loader = index_loader.batch(batch_size=args.num_samples)
+
+        return index_loader
+
+    index_loader_1 = create_index_loader()
+    index_loader_2 = create_index_loader()
 
     try:
         for epoch_id in tqdm(iterable=range(args.num_epochs), desc='Epoch', position=0):
 
-            for sample_indices_1 in tfds.as_numpy(dataset=index_loader_1):
+            for sample_indices_1, sample_indices_2 in zip(tfds.as_numpy(dataset=index_loader_1), tfds.as_numpy(dataset=index_loader_2)):
 
-                # extract features
-                features_1 = get_features(state=state_1, split_name='train', sample_indices=sample_indices_1, args=args)
-                features_1 = np.asanyarray(a=features_1)
+                def relabel_data_wrapper(
+                        state_: train_state.TrainState,
+                        sample_indices_: chex.Array,
+                        log_p_y_: chex.Array,
+                        log_mult_prob_: chex.Array
+                ) -> tuple[chex.Array, chex.Array]:
+                    """This is a wrapper to execute the following actions:
+                    - extract features
+                    - find nearest neighbours
+                    - solve for similarity coding coefficients
+                    - re-label data
+                    """
+                    # extract features
+                    features = get_features(state=state_, split_name='train', sample_indices=sample_indices_, args=args)
+                    features = np.asanyarray(a=features)
 
-                # find K nearest-neighbours
-                knn_indices_1_ = get_knn_indices(xb=features_1, sample_indices=sample_indices_1, args=args)
+                    # find K nearest-neighbours
+                    knn_indices_ = get_knn_indices(xb=features, sample_indices=sample_indices_, args=args)
 
-                # calculate coding mtrices
-                coding_matrix_1_ = get_batch_local_affine_coding(samples=features_1, knn_indices=knn_indices_1_)
+                    # calculate coding mtrices
+                    coding_matrix_ = get_batch_local_affine_coding(samples=features, knn_indices=knn_indices_)
 
-                # knn_indices_1 = knn_indices_1.at[sample_indices_1].set(values=knn_indices_1_)
-                # coding_matrix_1 = coding_matrix_1.at[sample_indices_1].set(values=coding_matrix_1_)
+                    # run EM and re-label samples
+                    return relabel_data(
+                        log_p_y=log_p_y_,
+                        log_mult_prob=log_mult_prob_,
+                        nn_idx=knn_indices_,
+                        coding_matrix=coding_matrix_,
+                        sample_indices=sample_indices_,
+                        args=args
+                    )
 
-                # run EM and re-label samples
-                log_p_y_1, log_mult_prob_1 = relabel_data(
-                    log_p_y=log_p_y_1,
-                    log_mult_prob=log_mult_prob_1,
-                    nn_idx=knn_indices_1_,
-                    coding_matrix=coding_matrix_1_,
-                    sample_indices=sample_indices_1,
-                    args=args
+                log_p_y_1, log_mult_prob_1 = relabel_data_wrapper(
+                    state_=state_1,
+                    sample_indices_=sample_indices_1,
+                    log_p_y_=log_p_y_1,
+                    log_mult_prob_=log_mult_prob_1
+                )
+
+                log_p_y_2, log_mult_prob_2 = relabel_data_wrapper(
+                    state_=state_2,
+                    sample_indices_=sample_indices_2,
+                    log_p_y_=log_p_y_2,
+                    log_mult_prob_=log_mult_prob_2
                 )
 
             # region TRAIN models on relabelled data
             state_1 = train_model(
                 state=state_1,
                 dataset_train=dataset_train,
+                p_y=jnp.exp(log_p_y_2),
+                num_epochs=1,
+                aim_run=aim_run,
+                args=args
+            )
+            state_2 = train_model(
+                state=state_2,
+                dataset_train=dataset_train,
                 p_y=jnp.exp(log_p_y_1),
-                num_epochs=args.num_warmup,
+                num_epochs=1,
                 aim_run=aim_run,
                 args=args
             )
             # endregion
-
-            # # region MONITOR SAMPLES
-            # for key in samples_monitored:
-            #     aim_run.track(
-            #         value=aim.Distribution.from_histogram(
-            #             hist=p_y[key].cpu().to_dense(),
-            #             bin_range=(-0.5, args.num_classes - 0.5)
-            #         ),
-            #         name='p(y) {:d}'.format(key),
-            #         step=epoch_id + 1,
-            #         context={'Clean label': samples_monitored[key]}
-            #     )
-            # # endregion
-
-            # if (epoch_id % 10 == 0) and (epoch_id > 0):
-            #     # save checkpoint
-            #     torch.save(
-            #         obj={'state_dict': state_dicts, 'state_dict2': state_dicts2},
-            #         f=os.path.join(args.logdir, aim_run.hash, 'Epoch_{:d}.pytorch'.format(epoch_id + 1))
-            #     )
 
         logging.info(msg='Training is completed.')
     finally:
@@ -724,8 +753,6 @@ def main() -> None:
 
 
 if __name__ == '__main__':
-    # logging.basicConfig(level=logging.INFO)
-    # tf.get_logger().setLevel(logging.ERROR)
     logger_current = logging.getLogger(name=__name__)
     logger_current.setLevel(level=logging.INFO)
     main()
