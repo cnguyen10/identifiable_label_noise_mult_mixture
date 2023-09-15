@@ -456,7 +456,7 @@ def evaluate(state: train_state.TrainState, args: argparse.Namespace) -> chex.Ar
 
     accuracy = metrics.Accuracy(total=jnp.array(0.), count=jnp.array(0))
 
-    for image, label in tqdm(iterable=tfds.as_numpy(dataset=ds), desc='Validate', position=1, leave=False):
+    for image, label in tqdm(iterable=tfds.as_numpy(dataset=ds), desc=' validate', position=2, leave=False):
         x = jnp.array(object=image) / 255.
         y = jnp.array(label)
 
@@ -577,9 +577,7 @@ def main() -> None:
         current_index = current_index + batch_size_
 
     # initialize p_y and mult_probs
-    soften_factor = 0.75
-    log_p_y_1 = log_p_y_1 + soften_factor / (args.num_classes - 1)
-    log_p_y_1 = np.clip(a=log_p_y_1, a_min=0, a_max=1 - soften_factor)
+    log_p_y_1 = optax.smooth_labels(labels=log_p_y_1, alpha=0.1)
     log_p_y_1 = jnp.log(log_p_y_1)
 
     log_mult_prob_1 = jnp.eye(N=args.num_classes)  # (C, C)
@@ -594,7 +592,6 @@ def main() -> None:
 
     del current_index
     del batch_size_
-    del soften_factor
 
     dataset_train = ds_builder.as_dataset(split='train', as_supervised=True)
     # endregion
@@ -641,7 +638,7 @@ def main() -> None:
     if not aim.sdk.repo.Repo.exists(path=args.logdir):
         logging.info(msg='Initialize AIM repository')
         # aim.sdk.repo.Repo(path=args.logdir, read_only=False, init=True)
-        subprocess.run(args=["aim", "init", "."])
+        subprocess.run(args=["aim", "init"])
 
     aim_run = aim.Run(
         repo=args.logdir,
