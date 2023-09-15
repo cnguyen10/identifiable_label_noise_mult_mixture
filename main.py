@@ -296,32 +296,32 @@ def get_batch_local_affine_coding(samples: np.ndarray, knn_indices: np.ndarray) 
 
 
 def get_p_y(
-        mixture_coefficients: chex.Array,
-        multinomial_probs: chex.Array,
+        log_mixture_coefficients: chex.Array,
+        log_multinomial_probs: chex.Array,
         args: argparse.Namespace) -> tuple[chex.Array, chex.Array]:
     """Infer the noisy label distribution as a C-multinomial mixture model
         using EM. The data is generated from a (K + 1)C-multinomial mixture
         models obtained via nearest-neighbours
 
     Args:
-        mixture_coefficients:
-        multinomial_probs: the probability matrix containing probability
+        log_mixture_coefficients:
+        log_multinomial_probs: the probability matrix containing probability
             vectors of (K + 1)C multinomial distributions
-        args:
+        args: object storing configuration parameters
 
     Returns:
-        p_y:
-        mult_prob: a matrix containing the probability vectors of
+        log_p_y:
+        log_mult_prob: a matrix containing the probability vectors of
             C-multinomial distributions
     """
     mixture_distribution = tfp.distributions.Categorical(
-        probs=mixture_coefficients,
+        logits=log_mixture_coefficients,
         validate_args=True,
         allow_nan_stats=False
     )
     component_distribution = tfp.distributions.Multinomial(
         total_count=args.num_noisy_labels_per_sample,
-        probs=multinomial_probs,
+        logits=log_multinomial_probs,
         validate_args=True
     )
 
@@ -338,14 +338,14 @@ def get_p_y(
     )  # (sample_shape, N, C)
     yhat = jnp.transpose(a=yhat, axes=(1, 0, 2))  # (N, sample_shape, C)
 
-    p_y, mult_prob = EM_for_mm(y=yhat, args=args)
+    log_p_y, log_mult_prob = EM_for_mm(y=yhat, args=args)
 
-    return p_y, mult_prob
+    return log_p_y, log_mult_prob
 
 
 def relabel_data(
-        p_y: chex.Array,
-        mult_prob: chex.Array,
+        log_p_y: chex.Array,
+        log_mult_prob: chex.Array,
         nn_idx: chex.Array,
         coding_matrix: chex.Array,
         sample_indices: chex.Array,
@@ -356,8 +356,8 @@ def relabel_data(
     This assumption enables the vectorization in the implementation.
 
     Args:
-        p_y: a row-wise matrix containing the "cleaner" label distributions of samples  (N , C)
-        mult_prob: a tensor containing the transition matrices of samples  (N, C, C)
+        log_p_y: a row-wise matrix containing the "cleaner" label distributions of samples  (N , C)
+        log_mult_prob: a tensor containing the transition matrices of samples  (N, C, C)
         nn_idx: a matrix where each row contains the indices of nearest-neighbours corresponding to row (sample) id  (N, K)
         coding_matrix: a matrix where each row contains the coding coefficient (normalised similarity)  (N, K)
         args: contains configuration parameters
@@ -368,8 +368,8 @@ def relabel_data(
         mult_prob: a sparse 3-d tensor where each matrix is p(yhat | x, y)  # (N, C , C)
     """
     # initialize new p(y | x) and p(yhat | x, y)
-    p_y_new = p_y + 0.
-    mult_prob_new = mult_prob + 0.
+    log_p_y_new = log_p_y + 0.
+    log_mult_prob_new = log_mult_prob + 0.
 
     data_loader = tf.data.Dataset.from_tensor_slices(tensors=sample_indices)
     data_loader = data_loader.batch(batch_size=args.batch_size_em)
@@ -380,47 +380,47 @@ def relabel_data(
         batch_size_ = indices.size
 
         # extract the corresponding noisy labels
-        p_y_ = p_y[indices]  # (B, C)
-        mult_prob_ = mult_prob[indices]  # (B, C, C)
+        log_p_y_ = log_p_y[indices]  # (B, C)
+        log_mult_prob_ = log_mult_prob[indices]  # (B, C, C)
 
         # extract coding coefficients
-        nn_coding = coding_matrix[indices]  # (B, K)
+        log_nn_coding = jnp.log(coding_matrix[indices])  # (B, K)
 
         # region APPROXIMATE p(y | x) through nearest-neighbours
         nn_idx_ = nn_idx[current_index:(current_index + batch_size_)]
-        p_y_nn = p_y[nn_idx_]  # (B, K, C)
-        mult_prob_nn = mult_prob[nn_idx_]  # (B, K, C, C)
-        mult_prob_nn = jnp.reshape(a=mult_prob_nn, newshape=(mult_prob_nn.shape[0], -1, mult_prob_nn.shape[-1]))  # (B, K*C, C)
+        log_p_y_nn = log_p_y[nn_idx_]  # (B, K, C)
+        log_mult_prob_nn = log_mult_prob[nn_idx_]  # (B, K, C, C)
+        log_mult_prob_nn = jnp.reshape(a=log_mult_prob_nn, newshape=(log_mult_prob_nn.shape[0], -1, log_mult_prob_nn.shape[-1]))  # (B, K*C, C)
 
         # calculate the mixture coefficients of other mixtures
         # induced by nearest-neighbours
-        mixture_coef_nn = (1 - args.mu) * nn_coding[:, :, None] * p_y_nn  # (B, K, C)
-        mixture_coef_nn = jnp.reshape(a=mixture_coef_nn, newshape=(mixture_coef_nn.shape[0], -1))  # (B, K*C)
+        log_mixture_coefficient_nn = jnp.log(1 - args.mu) + log_nn_coding[:, :, None] + log_p_y_nn  # (B, K, C)
+        log_mixture_coefficient_nn = jnp.reshape(a=log_mixture_coefficient_nn, newshape=(log_mixture_coefficient_nn.shape[0], -1))  # (B, K*C)
 
-        mixture_coef_x = args.mu * p_y_  # (B, C)
+        log_mixture_coefficient_x = jnp.log(args.mu) + log_p_y_  # (B, C)
 
-        mixture_coef = jnp.concatenate(arrays=(mixture_coef_x, mixture_coef_nn), axis=-1)  # (B, (K + 1) * C)
-        multinomial_probs = jnp.concatenate(arrays=(mult_prob_, mult_prob_nn), axis=1)  # (B, (K + 1) * C, C)
+        log_mixture_coefficient = jnp.concatenate(arrays=(log_mixture_coefficient_x, log_mixture_coefficient_nn), axis=-1)  # (B, (K + 1) * C)
+        log_multinomial_probs = jnp.concatenate(arrays=(log_mult_prob_, log_mult_prob_nn), axis=1)  # (B, (K + 1) * C, C)
         # endregion
 
         # predict the clean label distribution using EM
-        p_y_temp, mult_prob_temp = get_p_y(
-            mixture_coefficients=mixture_coef,
-            multinomial_probs=multinomial_probs,
+        log_p_y_temp, log_mult_prob_temp = get_p_y(
+            log_mixture_coefficients=log_mixture_coefficient,
+            log_multinomial_probs=log_multinomial_probs,
             args=args
         )
 
-        if jnp.any(a=jnp.isnan(p_y_temp)):
+        if jnp.any(a=jnp.isnan(log_p_y_temp)):
             raise ValueError('NaN is detected after running EM')
 
         # update the noisy labels
-        p_y_new = p_y_new.at[indices].set(values=p_y_temp)
-        mult_prob_new = mult_prob_new.at[indices].set(values=mult_prob_temp)
+        log_p_y_new = log_p_y_new.at[indices].set(values=log_p_y_temp)
+        log_mult_prob_new = log_mult_prob_new.at[indices].set(values=log_mult_prob_temp)
 
         # update current index
         current_index = current_index + batch_size_
 
-    return p_y_new, mult_prob_new
+    return log_p_y_new, log_mult_prob_new
 
 
 def cross_entropy_loss(
@@ -561,7 +561,7 @@ def main() -> None:
 
     # get noisy labels
     dataset_train = ds_builder.as_dataset(split='train', shuffle_files=False, as_supervised=True, batch_size=args.batch_size)
-    p_y_1 = jnp.empty(shape=(args.total_num_samples, args.num_classes), dtype=jnp.float32)  # (N, C)
+    log_p_y_1 = jnp.empty(shape=(args.total_num_samples, args.num_classes), dtype=jnp.float32)  # (N, C)
     current_index = 0
     for x, yhat in tqdm(iterable=tfds.as_numpy(dataset=dataset_train), desc='get noisy labels', leave=False, position=1):
         # track how many samples
@@ -571,24 +571,25 @@ def main() -> None:
         noisy_labels = jax.nn.one_hot(x=yhat, num_classes=args.num_classes, dtype=jnp.float32)
 
         # assign to yhats
-        p_y_1 = p_y_1.at[current_index:(current_index + batch_size_)].set(noisy_labels)
+        log_p_y_1 = log_p_y_1.at[current_index:(current_index + batch_size_)].set(noisy_labels)
 
         current_index = current_index + batch_size_
 
     # initialize p_y and mult_probs
     soften_factor = 0.75
-    p_y_1 = p_y_1 + soften_factor / (args.num_classes - 1)
-    p_y_1 = np.clip(a=p_y_1, a_min=0, a_max=1 - soften_factor)
+    log_p_y_1 = log_p_y_1 + soften_factor / (args.num_classes - 1)
+    log_p_y_1 = np.clip(a=log_p_y_1, a_min=0, a_max=1 - soften_factor)
+    log_p_y_1 = jnp.log(log_p_y_1)
 
-    mult_prob_1 = jnp.eye(N=args.num_classes)  # (C, C)
-    mult_prob_1 = jnp.tile(A=mult_prob_1[None, :, :], reps=(args.total_num_samples, 1, 1))  # (N, C, C)
+    log_mult_prob_1 = jnp.eye(N=args.num_classes)  # (C, C)
+    log_mult_prob_1 = jnp.tile(A=log_mult_prob_1[None, :, :], reps=(args.total_num_samples, 1, 1))  # (N, C, C)
 
     # add random noise
-    mult_prob_1 = 10 * mult_prob_1 + np.random.rand(*mult_prob_1.shape)
-    mult_prob_1 = jax.nn.softmax(x=mult_prob_1, axis=-1)
+    log_mult_prob_1 = 10 * log_mult_prob_1 + np.random.rand(*log_mult_prob_1.shape)
+    log_mult_prob_1 = jax.nn.log_softmax(x=log_mult_prob_1, axis=-1)
 
-    # p_y_2 = p_y_1 + 0.
-    # mult_prob_2 = mult_prob_1 + 0.
+    # log_p_y_2 = log_p_y_1 + 0.
+    # log_mult_prob_2 = log_mult_prob_1 + 0.
 
     del current_index
     del batch_size_
@@ -610,7 +611,7 @@ def main() -> None:
     )
     tx = optax.sgd(learning_rate=lr_schedule_fn, momentum=0.9)  # define an optimizer
 
-    state = TrainState.create(
+    state_1 = TrainState.create(
         apply_fn=model.apply,
         params=params['params'],
         batch_stats=params['batch_stats'],
@@ -642,7 +643,14 @@ def main() -> None:
     # endregion
 
     # # region WARM-UP
-    state = train_model(state=state, dataset_train=dataset_train, p_y=p_y_1, num_epochs=args.num_warmup, aim_run=aim_run, args=args)
+    state_1 = train_model(
+        state=state_1,
+        dataset_train=dataset_train,
+        p_y=jnp.exp(log_p_y_1),
+        num_epochs=args.num_warmup,
+        aim_run=aim_run,
+        args=args
+    )
     # # endregion
 
     # define data-loaders to create sample indices
@@ -656,7 +664,7 @@ def main() -> None:
             for sample_indices_1 in tfds.as_numpy(dataset=index_loader_1):
 
                 # extract features
-                features_1 = get_features(state=state, split_name='train', sample_indices=sample_indices_1, args=args)
+                features_1 = get_features(state=state_1, split_name='train', sample_indices=sample_indices_1, args=args)
                 features_1 = np.asanyarray(a=features_1)
 
                 # find K nearest-neighbours
@@ -669,9 +677,9 @@ def main() -> None:
                 # coding_matrix_1 = coding_matrix_1.at[sample_indices_1].set(values=coding_matrix_1_)
 
                 # run EM and re-label samples
-                p_y_1, mult_prob_1 = relabel_data(
-                    p_y=p_y_1,
-                    mult_prob=mult_prob_1,
+                log_p_y_1, log_mult_prob_1 = relabel_data(
+                    log_p_y=log_p_y_1,
+                    log_mult_prob=log_mult_prob_1,
                     nn_idx=knn_indices_1_,
                     coding_matrix=coding_matrix_1_,
                     sample_indices=sample_indices_1,
@@ -679,7 +687,14 @@ def main() -> None:
                 )
 
             # region TRAIN models on relabelled data
-            state = train_model()
+            state_1 = train_model(
+                state=state_1,
+                dataset_train=dataset_train,
+                p_y=jnp.exp(log_p_y_1),
+                num_epochs=args.num_warmup,
+                aim_run=aim_run,
+                args=args
+            )
             # endregion
 
             # # region MONITOR SAMPLES

@@ -97,7 +97,7 @@ def EM_for_mm_jit(
         log_mult_comps_probs = log_mult_comps_probs_num - log_mult_comps_probs_den[:, :, None]
         # mult_comps_probs = jnp.exp(log_mult_comps_probs)
 
-    return jnp.exp(log_mixture_coefficients), jnp.exp(log_mult_comps_probs)
+    return log_mixture_coefficients, log_mult_comps_probs
 
 
 def EM_for_mm(y: chex.Array, args: Namespace) -> tuple[chex.Array, chex.Array]:
@@ -108,8 +108,8 @@ def EM_for_mm(y: chex.Array, args: Namespace) -> tuple[chex.Array, chex.Array]:
         args: an object storing configuration information
 
     Returns:
-        mix_coef:
-        mult_comps_probs:
+        log_mixture_coefficients:
+        log_mult_comps_probs:
     """
     batch_size_, n_, d_ = y.shape
     return EM_for_mm_jit(
