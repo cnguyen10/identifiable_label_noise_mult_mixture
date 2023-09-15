@@ -648,6 +648,7 @@ def main() -> None:
         capture_terminal_logs=False,
         system_tracking_interval=600  # capture every x seconds
     )
+    aim_run['hparams'] = {key: args.__dict__[key] for key in args.__dict__ if isinstance(args.__dict__[key], (int, bool, str, float))}
     # endregion
 
     # # region WARM-UP
