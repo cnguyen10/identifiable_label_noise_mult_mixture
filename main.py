@@ -39,8 +39,8 @@ from typing import Any
 import chex
 
 from PreactResnet import ResNet18
-from AnnotatedDataset import ImageFolder_2
 from utils import EM_for_mm
+from data_utils import image_folder_label_csv
 
 
 def parse_arguments() -> argparse.Namespace:
@@ -104,14 +104,13 @@ def parse_arguments() -> argparse.Namespace:
     return args
 
 
-def get_features(state: train_state.TrainState, split_name: str, sample_indices: chex.Array, args: argparse.Namespace) -> chex.Array:
+def get_features(state: train_state.TrainState, ds: tf.data.Dataset, batch_size: chex.Numeric) -> chex.Array:
     """Extract features of data
 
     Args:
         state: a data-class storing model-related parameters
-        split_name: either 'train' or 'test'
-        sample_indices: the indices of the samples being feature-extracted
-        args: configuration object
+        ds: the dataset of interest
+        batch_size:
 
     Returns:
         xb: the extracted features
@@ -129,22 +128,8 @@ def get_features(state: train_state.TrainState, split_name: str, sample_indices:
             method=lambda module, x: module.features(x=x, train=False)
         )
 
-    ds_builder = ds_builder = ImageFolder_2(
-        root_dir=args.dataset_root,
-        noise_rate=args.noise_rate,
-        split_name=split_name,
-        sample_indices=sample_indices,
-        shape=args.img_shape
-    )
-    data_loader = ds_builder.as_dataset(
-        split='train',
-        shuffle_files=False,
-        as_supervised=True,
-        batch_size=args.batch_size
-    )
-
     # get feature dimension
-    for x, _ in tqdm(iterable=tfds.as_numpy(dataset=data_loader), desc=' Extract features', leave=False, position=1):
+    for x, _ in tqdm(iterable=tfds.as_numpy(dataset=ds), desc=' features', leave=False, position=1):
         x = jnp.array(object=x) / 255.
         features, _ = feature_fn(
             model=state.model,
@@ -153,12 +138,14 @@ def get_features(state: train_state.TrainState, split_name: str, sample_indices:
         )
         break
 
-    xb = jnp.empty(shape=(sample_indices.size, features.shape[-1]))  # (N, D)
+    xb = jnp.empty(shape=(len(ds), features.shape[-1]))  # (N, D)
+
+    ds = ds.batch(batch_size=batch_size)
 
     # region EXTRACT FEATURES
     start_idx = 0
     for x, _ in tqdm(
-        iterable=data_loader,
+        iterable=tfds.as_numpy(dataset=ds),
         desc='Extract features',
         leave=False,
         position=1
@@ -171,7 +158,6 @@ def get_features(state: train_state.TrainState, split_name: str, sample_indices:
         )
 
         end_idx = start_idx + x.shape[0]
-        # xb[start_idx:end_idx, :] = features
         xb = xb.at[start_idx:end_idx].set(features)
         start_idx = end_idx
     # endregion
@@ -179,7 +165,7 @@ def get_features(state: train_state.TrainState, split_name: str, sample_indices:
     return xb
 
 
-def get_knn_indices(xb: np.ndarray, sample_indices: np.ndarray, args: argparse.Namespace) -> np.ndarray:
+def get_knn_indices(xb: np.ndarray, sample_indices: np.ndarray, num_nn: chex.Numeric) -> np.ndarray:
     """find the indices of k-nearest neighbours
 
     Args:
@@ -199,13 +185,13 @@ def get_knn_indices(xb: np.ndarray, sample_indices: np.ndarray, args: argparse.N
     gpu_index_flat.add_with_ids(xb, sample_indices)  # add vectors to the index
 
     # start the nearest-neighbour search
-    _, index_matrix = gpu_index_flat.search(x=xb, k=args.k + 1)  # adding 1 is because the return includes the sample itself
+    _, index_matrix = gpu_index_flat.search(x=xb, k=num_nn + 1)  # adding 1 is because the return includes the sample itself
 
     return index_matrix[:, 1:]  # exclude the first element which is the sample itself
 
 
-@jax.jit
-def solve_local_affine_coding(datum: jax.Array, knn: jax.Array) -> jax.Array:
+# @jax.jit
+def solve_local_affine_coding(datum: chex.Array, knn: chex.Array) -> jax.Array:
     """A JAX-jittable method to calculate the local affine coding of a single sample
     from its nearest neighbours
     The optimization is an operator-splitted quadratic program (OSQP):
@@ -447,13 +433,16 @@ def cross_entropy_loss(
     return loss, updates
 
 
-def evaluate(state: train_state.TrainState, args: argparse.Namespace) -> chex.Array:
-    """
-    """
-    builder = tfds.ImageFolder(root_dir=args.dataset_root)
-    split_name = 'test'
-    ds = builder.as_dataset(split=split_name, shuffle_files=False, as_supervised=True, batch_size=args.batch_size)
+def evaluate(state: train_state.TrainState, ds: tf.data.Dataset) -> chex.Array:
+    """Evaluate the model on the given dataset
 
+    Args:
+        state: train_state includes params and model
+        ds: the batched dataset of interest
+
+    Returns:
+        prediction accuracy on the given dataset
+    """
     accuracy = metrics.Accuracy(total=jnp.array(0.), count=jnp.array(0))
 
     for image, label in tqdm(iterable=tfds.as_numpy(dataset=ds), desc=' validate', position=2, leave=False):
@@ -487,6 +476,15 @@ def train_model(state: train_state.TrainState, dataset_train: tf.data.Dataset, p
     rand_flip_lr = jax.vmap(fun=dm_pix.random_flip_left_right, in_axes=(0, 0))
     augmentation_list = [rand_flip_ud, rand_flip_lr]
 
+    # testing dataset
+    dataset_test, _ = image_folder_label_csv(
+        root_dir=os.path.join(args.dataset_root, 'test'),
+        csv_path=os.path.join(args.dataset_root, 'split', 'clean_validation'),
+        sample_indices=None,
+        image_shape=args.img_shape
+    )
+    dataset_test = dataset_test.batch(batch_size=args.batch_size)
+
     for _ in tqdm(iterable=range(num_epochs), desc='train', leave=False, position=1):
 
         # define metrics
@@ -511,7 +509,7 @@ def train_model(state: train_state.TrainState, dataset_train: tf.data.Dataset, p
         aim_run.track(value=loss_accumulate.compute(), name='Loss', context={'model': state.model_id})
 
         # region EVALUATION
-        acc = evaluate(state=state, args=args)
+        acc = evaluate(state=state, ds=dataset_test)
         aim_run.track(value=acc, name='Accuracy', context={'model': state.model_id})
         # endregion
 
@@ -555,16 +553,24 @@ def main() -> None:
     # region DATASET
     # convert image-shape from string to int
     args.img_shape = [int(ishape) for ishape in args.img_shape]
-    ds_builder = ImageFolder_2(root_dir=args.dataset_root, noise_rate=args.noise_rate, split_name='train', shape=args.img_shape)
 
-    args.num_classes = len(ds_builder.info.features['label'].names)
-    args.total_num_samples = ds_builder.info.splits['train'].num_examples
+    # load training dataset
+    dataset_train, labels = image_folder_label_csv(
+        root_dir=os.path.join(args.dataset_root, 'train'),
+        csv_path=os.path.join(args.dataset_root, 'split', 'label_noise_{:.1f}'.format(args.noise_rate)),
+        sample_indices=None,
+        image_shape=args.img_shape
+    )
 
-    # get noisy labels
-    dataset_train = ds_builder.as_dataset(split='train', shuffle_files=False, as_supervised=True, batch_size=args.batch_size)
+    args.num_classes = len(set(labels))
+    args.total_num_samples = len(dataset_train)
+
+    # make a dataset of noisy labels
+    label_dataset = tf.data.Dataset.from_tensor_slices(tensors=labels).batch(batch_size=args.batch_size)
+
     log_p_y_1 = jnp.empty(shape=(args.total_num_samples, args.num_classes), dtype=jnp.float32)  # (N, C)
     current_index = 0
-    for x, yhat in tqdm(iterable=tfds.as_numpy(dataset=dataset_train), desc='get noisy labels', leave=False, position=1):
+    for yhat in tqdm(iterable=tfds.as_numpy(dataset=label_dataset), desc='get noisy labels', leave=False, position=1):
         # track how many samples
         batch_size_ = yhat.shape[0]
 
@@ -590,14 +596,14 @@ def main() -> None:
     log_p_y_2 = log_p_y_1 + 0.
     log_mult_prob_2 = log_mult_prob_1 + 0.
 
+    del labels
+    del label_dataset
     del current_index
     del batch_size_
-
-    dataset_train = ds_builder.as_dataset(split='train', as_supervised=True)
     # endregion
 
     # region MODEL
-    model = ResNet18(num_classes=len(ds_builder.info.features['label'].names))
+    model = ResNet18(num_classes=args.num_classes)
 
     lr_schedule_fn = optax.cosine_decay_schedule(
         init_value=args.lr,
@@ -624,8 +630,7 @@ def main() -> None:
 
         return state
 
-    state_1 = initialize_train_state(model_id=1)
-    state_2 = initialize_train_state(model_id=2)
+    state_1, state_2 = [initialize_train_state(model_id=model_id) for model_id in range(2)]
     # endregion
 
     # region EXPERIMENT TRACKING
@@ -691,12 +696,22 @@ def main() -> None:
                     - solve for similarity coding coefficients
                     - re-label data
                     """
+                    sub_dataset, _ = image_folder_label_csv(
+                        root_dir=os.path.join(args.dataset_root, 'train'),
+                        csv_path=os.path.join(args.dataset_root, 'split', 'label_noise_{:.1f}'.format(args.noise_rate)),
+                        sample_indices=sample_indices_,
+                        image_shape=args.img_shape
+                    )
                     # extract features
-                    features = get_features(state=state_, split_name='train', sample_indices=sample_indices_, args=args)
+                    features = get_features(
+                        state=state_,
+                        ds=sub_dataset,
+                        batch_size=args.batch_size
+                    )
                     features = np.asanyarray(a=features)
 
                     # find K nearest-neighbours
-                    knn_indices_ = get_knn_indices(xb=features, sample_indices=sample_indices_, args=args)
+                    knn_indices_ = get_knn_indices(xb=features, sample_indices=sample_indices_, num_nn=args.k)
 
                     # calculate coding mtrices
                     coding_matrix_ = get_batch_local_affine_coding(samples=features, knn_indices=knn_indices_)
