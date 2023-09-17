@@ -33,7 +33,7 @@ def batched_logmatmulexp_(logA: chex.Array, logB: chex.Array) -> chex.Array:
 
 
 @partial(jax.jit, static_argnums=(1, 2, 3, 4, 5, 6, 7))
-def EM_for_mm_jit(
+def EM_for_mm(
     y: chex.Array,
     batch_size_: chex.Numeric,
     n_: chex.Numeric,
@@ -45,8 +45,6 @@ def EM_for_mm_jit(
 ) -> tuple[chex.Array, chex.Array]:
     """
     """
-    # batch_size_, n_, d_ = y.shape
-
     # region initialize MIXTURE COEFFICIENTS and MULTINOMIAL COMPONENTS
     mixture_coefficients = jnp.array(object=[[1/d_] * d_] * batch_size_)  # (N, C)
 
@@ -98,27 +96,3 @@ def EM_for_mm_jit(
         # mult_comps_probs = jnp.exp(log_mult_comps_probs)
 
     return log_mixture_coefficients, log_mult_comps_probs
-
-
-def EM_for_mm(y: chex.Array, args: Namespace) -> tuple[chex.Array, chex.Array]:
-    """Run EM to infer the parameter of a multinomial mixture
-
-    Args:
-        y: number of samples  # (N, num_mult_label_sets, C)
-        args: an object storing configuration information
-
-    Returns:
-        log_mixture_coefficients:
-        log_mult_comps_probs:
-    """
-    batch_size_, n_, d_ = y.shape
-    return EM_for_mm_jit(
-        y=y,
-        batch_size_=batch_size_,
-        n_=n_,
-        d_=d_,
-        num_noisy_labels_per_sample=args.num_noisy_labels_per_sample,
-        num_em_iter=args.num_em_iter,
-        alpha=args.alpha,
-        beta=args.beta
-    )

@@ -5,6 +5,9 @@ import jax.dlpack  # transfer between jax and tf
 import flax
 from flax import linen as nn
 from flax.training import train_state
+from flax.training import orbax_utils
+import orbax.checkpoint as ocp
+
 import optax
 
 from jaxopt import OSQP
@@ -96,6 +99,10 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument('--train', dest='train_flag', action='store_true')
     parser.add_argument('--test', dest='train_flag', action='store_false')
     parser.set_defaults(train_flag=True)
+
+    parser.add_argument('--resume', dest='resume', action='store_true')
+    parser.set_defaults(resume=False)
+    parser.add_argument('--run-hash-id', type=str, default=None, help='Hash id of the run to resume')
 
     parser.add_argument('--jax-mem-fraction', type=float, default=0.1, help='Percentage of GPU memory allocated for Jax')
 
@@ -231,7 +238,8 @@ def solve_local_affine_coding(datum: chex.Array, knn: chex.Array) -> jax.Array:
 
     # the OSQP stops at a certain point and the solution might be closed,
     # but not exact. Thus, we need to enforce the constrains:
-    x = jnp.abs(x)  # non-negative number
+    # x = jnp.abs(x)  # non-negative number
+    x = jax.nn.relu(x)
     x = x / jnp.sum(a=x, axis=-1)  # sum to 1
 
     return x
@@ -324,7 +332,16 @@ def get_p_y(
     )  # (sample_shape, N, C)
     yhat = jnp.transpose(a=yhat, axes=(1, 0, 2))  # (N, sample_shape, C)
 
-    log_p_y, log_mult_prob = EM_for_mm(y=yhat, args=args)
+    log_p_y, log_mult_prob = EM_for_mm(
+        y=yhat,
+        batch_size_=args.batch_size_em,
+        n_=args.num_multinomial_samples,
+        d_=args.num_classes,
+        num_noisy_labels_per_sample=args.num_noisy_labels_per_sample,
+        num_em_iter=args.num_em_iter,
+        alpha=args.alpha,
+        beta=args.beta
+    )
 
     return log_p_y, log_mult_prob
 
@@ -646,6 +663,7 @@ def main() -> None:
         subprocess.run(args=["aim", "init"])
 
     aim_run = aim.Run(
+        run_hash=args.run_hash_id,
         repo=args.logdir,
         read_only=False,
         experiment=args.experiment_name,
@@ -654,6 +672,61 @@ def main() -> None:
         system_tracking_interval=600  # capture every x seconds
     )
     aim_run['hparams'] = {key: args.__dict__[key] for key in args.__dict__ if isinstance(args.__dict__[key], (int, bool, str, float))}
+
+    # create a folder with the corresponding hash run id to store checkpoints
+    args.checkpoint_dir = os.path.join(args.logdir, aim_run.hash)
+    if not os.path.exists(path=args.checkpoint_dir):
+        Path(args.checkpoint_dir).mkdir(parents=True, exist_ok=True)
+    # endregion
+
+    # region SETUP CHECKPOINT and RESTORE
+    checkpoint_options = ocp.CheckpointManagerOptions(
+        max_to_keep=1,
+        save_interval_steps=1
+    )
+    checkpoint_mngr = ocp.CheckpointManager(
+        directory=args.checkpoint_dir,
+        checkpointers={
+            'state_1': ocp.PyTreeCheckpointer(),
+            'state_2': ocp.PyTreeCheckpointer()
+        },
+        options=checkpoint_options
+    )
+
+    if args.resume:
+        # must be associated with a run hash id
+        assert args.run_hash_id is not None
+
+        # default restore will be in raw dictionary
+        # create an example structure to restore to the dataclass of interest
+        checkpoint_example = {
+            'state_1': {
+                'state': state_1,
+                'log_p_y': log_p_y_1,
+                'log_mult_prob': log_mult_prob_1
+            },
+            'state_2': {
+                'state': state_2,
+                'log_p_y': log_p_y_2,
+                'log_mult_prob': log_mult_prob_2
+            }
+        }
+
+        restored = checkpoint_mngr.restore(
+            step=checkpoint_mngr.latest_step(),
+            items=checkpoint_example
+        )
+
+        state_1 = restored['state_1']['state']
+        log_p_y_1 = restored['state_1']['log_p_y']
+        log_mult_prob_1 = restored['state_1']['log_mult_prob']
+
+        state_2 = restored['state_2']['state']
+        log_p_y_2 = restored['state_2']['log_p_y']
+        log_mult_prob_2 = restored['state_2']['log_mult_prob']
+
+        del checkpoint_example
+        del restored
     # endregion
 
     # # region WARM-UP
@@ -676,8 +749,7 @@ def main() -> None:
 
         return index_loader
 
-    index_loader_1 = create_index_loader()
-    index_loader_2 = create_index_loader()
+    index_loader_1, index_loader_2 = [create_index_loader() for _ in range(2)]
 
     try:
         for epoch_id in tqdm(iterable=range(args.num_epochs), desc='Epoch', position=0):
@@ -758,6 +830,26 @@ def main() -> None:
                 args=args
             )
             # endregion
+
+            # save checkpoint
+            checkpoint = {
+                'state_1': {
+                    'state': state_1,
+                    'log_p_y': log_p_y_1,
+                    'log_mult_prob': log_mult_prob_1
+                },
+                'state_2': {
+                    'state': state_2,
+                    'log_p_y': log_p_y_2,
+                    'log_mult_prob': log_mult_prob_2
+                }
+            }
+            checkpoint_mngr.save(
+                step=epoch_id + 1,
+                items=checkpoint,
+                save_kwargs={'save_args': orbax_utils.save_args_from_target(checkpoint)}
+            )
+            del checkpoint
 
         logging.info(msg='Training is completed.')
     finally:
