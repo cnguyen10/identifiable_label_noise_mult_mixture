@@ -489,9 +489,21 @@ def train_model(state: train_state.TrainState, dataset_train: tf.data.Dataset, p
 
     # numpy random generator
     rng = np.random.default_rng(seed=None)
-    rand_flip_ud = jax.vmap(fun=dm_pix.random_flip_up_down, in_axes=(0, 0))
+    rand_crop = jax.vmap(
+        fun=lambda key, img: partial(
+            dm_pix.random_crop,
+            crop_sizes=args.img_shape
+        )(
+            key,
+            dm_pix.pad_to_size(
+                image=img,
+                target_height=args.img_shape[0] + 4,
+                target_width=args.img_shape[1] + 4)
+        ),
+        in_axes=(0, 0)
+    )
     rand_flip_lr = jax.vmap(fun=dm_pix.random_flip_left_right, in_axes=(0, 0))
-    augmentation_list = [rand_flip_ud, rand_flip_lr]
+    augmentation_list = [rand_crop, rand_flip_lr]
 
     # testing dataset
     dataset_test, _ = image_folder_label_csv(
@@ -517,6 +529,13 @@ def train_model(state: train_state.TrainState, dataset_train: tf.data.Dataset, p
             x = augment_fun(key, x)
 
             (loss, batch_stats_new), grads = loss_grad_fn(state.params, batch_stats=state.batch_stats, x=x, y=yhat)
+
+            # stochastic gradient Langevin dynamics
+            lr = args.lr_schedule_fn(state.step)
+            grads = jax.tree_map(
+                f=lambda x: x + jnp.sqrt(2 * lr) / len(dataset_noisy_labels) * jax.random.normal(key=key[0], shape=x.shape),
+                tree=grads
+            )
 
             state = state.apply_gradients(grads=grads)
             state = state.replace(batch_stats=batch_stats_new['batch_stats'])
@@ -569,7 +588,7 @@ def main() -> None:
 
     # region DATASET
     # convert image-shape from string to int
-    args.img_shape = [int(ishape) for ishape in args.img_shape]
+    args.img_shape = tuple([int(ishape) for ishape in args.img_shape])
 
     # load training dataset
     dataset_train, labels = image_folder_label_csv(
@@ -622,7 +641,7 @@ def main() -> None:
     # region MODEL
     model = ResNet18(num_classes=args.num_classes)
 
-    lr_schedule_fn = optax.cosine_decay_schedule(
+    args.lr_schedule_fn = optax.cosine_decay_schedule(
         init_value=args.lr,
         decay_steps=500*args.num_epochs
     )
@@ -634,7 +653,7 @@ def main() -> None:
         )
         x = jax.random.normal(key1, (1, 32, 32, 3))  # Dummy input data
         params = model.init(rngs=key2, x=x, train=False)
-        tx = optax.sgd(learning_rate=lr_schedule_fn, momentum=0.9)  # define an optimizer
+        tx = optax.sgd(learning_rate=args.lr_schedule_fn, momentum=0.9)  # define an optimizer
 
         state = TrainState.create(
             apply_fn=model.apply,
