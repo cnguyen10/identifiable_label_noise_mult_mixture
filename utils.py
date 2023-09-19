@@ -1,13 +1,13 @@
 import jax
 from jax import numpy as jnp
 
+import dm_pix
+
 from tensorflow_probability.substrates import jax as tfp
 
 import chex
 
 from functools import partial
-
-from argparse import Namespace
 
 
 @jax.jit
@@ -96,3 +96,26 @@ def EM_for_mm(
         # mult_comps_probs = jnp.exp(log_mult_comps_probs)
 
     return log_mixture_coefficients, log_mult_comps_probs
+
+
+def augment_an_image(key: jax.random.PRNGKey, image: chex.Array, image_shape: tuple[int, int, int]) -> chex.Array:
+    """perform data augmentation on a single image. For a batch of images,
+    please apply jax.vmap
+
+    Args:
+        key: the random key for PRNG
+        image: the image of interest
+        image_shape: a tuple of image shape (must be tuple, not list)
+
+    Returns:
+        image: the augmented image
+    """
+    image = dm_pix.pad_to_size(
+        image=image,
+        target_height=image.shape[0] + 4,
+        target_width=image.shape[1] + 4
+    )
+    image = dm_pix.random_crop(key=key, image=image, crop_sizes=image_shape)
+    image = dm_pix.random_flip_left_right(key=key, image=image)
+
+    return image

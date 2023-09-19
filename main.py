@@ -12,8 +12,6 @@ import optax
 
 from jaxopt import OSQP
 
-import dm_pix  # deep-mind image processing
-
 from clu import metrics
 
 import tensorflow_datasets as tfds
@@ -42,7 +40,7 @@ from typing import Any
 import chex
 
 from PreactResnet import ResNet18
-from utils import EM_for_mm
+from utils import EM_for_mm, augment_an_image
 from data_utils import image_folder_label_csv
 
 
@@ -482,6 +480,8 @@ def train_model(state: train_state.TrainState, dataset_train: tf.data.Dataset, p
 
     # generate another dataset for labels
     p_y_dataset = tf.data.Dataset.from_tensor_slices(tensors=p_y)
+    assert len(p_y_dataset) == len(dataset_train), \
+        f'Dataset lengths mismatch: len(p_y_dataset) = {len(p_y_dataset)}, while len(dataset_train) = {len(dataset_train)}'
     dataset_noisy_labels = tf.data.Dataset.zip(dataset_train, p_y_dataset)
     dataset_noisy_labels = dataset_noisy_labels.shuffle(buffer_size=args.total_num_samples, reshuffle_each_iteration=True)
     dataset_noisy_labels = dataset_noisy_labels.batch(batch_size=args.batch_size)
@@ -489,21 +489,10 @@ def train_model(state: train_state.TrainState, dataset_train: tf.data.Dataset, p
 
     # numpy random generator
     rng = np.random.default_rng(seed=None)
-    rand_crop = jax.vmap(
-        fun=lambda key, img: partial(
-            dm_pix.random_crop,
-            crop_sizes=args.img_shape
-        )(
-            key,
-            dm_pix.pad_to_size(
-                image=img,
-                target_height=args.img_shape[0] + 4,
-                target_width=args.img_shape[1] + 4)
-        ),
+    image_augmentation_fn = jax.vmap(
+        fun=partial(augment_an_image, image_shape=args.img_shape),
         in_axes=(0, 0)
     )
-    rand_flip_lr = jax.vmap(fun=dm_pix.random_flip_left_right, in_axes=(0, 0))
-    augmentation_list = [rand_crop, rand_flip_lr]
 
     # testing dataset
     dataset_test, _ = image_folder_label_csv(
@@ -525,8 +514,7 @@ def train_model(state: train_state.TrainState, dataset_train: tf.data.Dataset, p
 
             # data augmentation
             key = jax.vmap(fun=jax.random.PRNGKey)(rng.integers(low=0, high=2**63, size=y.size))
-            augment_fun = random.sample(population=augmentation_list, k=1)[0]
-            x = augment_fun(key, x)
+            x = image_augmentation_fn(key, x)
 
             (loss, batch_stats_new), grads = loss_grad_fn(state.params, batch_stats=state.batch_stats, x=x, y=yhat)
 
@@ -711,6 +699,7 @@ def main() -> None:
         },
         options=checkpoint_options
     )
+    # endregion
 
     if args.resume:
         # must be associated with a run hash id
@@ -746,19 +735,29 @@ def main() -> None:
 
         del checkpoint_example
         del restored
-    # endregion
 
-    # # region WARM-UP
-    for state_ in [state_1, state_2]:
-        state_ = train_model(
-            state=state_,
-            dataset_train=dataset_train,
-            p_y=jnp.exp(log_p_y_1),
-            num_epochs=args.num_warmup,
-            aim_run=aim_run,
-            args=args
-        )
-    # # endregion
+        # somehow model cannot be restored
+        # re-initialize the model
+        state_1, state_2 = [TrainState.create(
+            apply_fn=model.apply,
+            params=state_.params,
+            batch_stats=state_.batch_stats,
+            model=model,
+            model_id=state_.model_id,
+            tx=state_.tx
+        ) for state_ in [state_1, state_2]]
+    else:
+        # region WARM-UP
+        for state_ in [state_1, state_2]:
+            state_ = train_model(
+                state=state_,
+                dataset_train=dataset_train,
+                p_y=jnp.exp(log_p_y_1),
+                num_epochs=args.num_warmup,
+                aim_run=aim_run,
+                args=args
+            )
+        # endregion
 
     # define data-loaders to create sample indices
     def create_index_loader() -> tf.data.Dataset:
@@ -836,7 +835,7 @@ def main() -> None:
                 state=state_1,
                 dataset_train=dataset_train,
                 p_y=jnp.exp(log_p_y_2),
-                num_epochs=1,
+                num_epochs=5,
                 aim_run=aim_run,
                 args=args
             )
@@ -844,7 +843,7 @@ def main() -> None:
                 state=state_2,
                 dataset_train=dataset_train,
                 p_y=jnp.exp(log_p_y_1),
-                num_epochs=1,
+                num_epochs=5,
                 aim_run=aim_run,
                 args=args
             )
