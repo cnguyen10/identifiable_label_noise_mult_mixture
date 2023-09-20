@@ -52,15 +52,12 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument('--experiment-name', type=str, help='')
 
     parser.add_argument('--dataset-root', type=str, default=None, help='Path to the folder containing train and test sets')
-    # parser.add_argument('--csv-file-path', type=str, default=None)
-    # parser.add_argument('--delimiter', type=str, default=' ')
     parser.add_argument('--logdir', type=str, default='logs', help='Folder to store logs')
 
     parser.add_argument('--img-shape', action='append', help='e.g., 32 32 3 or 224 224 3')
     parser.add_argument('--num-samples', type=int, default=None, help='Number of samples in each iteration. None is whole dataset')
 
-    # parser.add_argument('--num-classes', type=int, help='Number of classes')
-    parser.add_argument('--noise-rate', type=float, help='Noise rate')
+    parser.add_argument('--label-filename', type=str, help='Filename of images and labels in the split folder')
 
     parser.add_argument('--k', type=int, help='Number of nearest neighbours')
     parser.add_argument('--num-noisy-labels-per-sample', type=int, help='Number of noisy labels per training sample')
@@ -83,16 +80,6 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument('--num-epochs', type=int, help='Number of epochs')
     # parser.add_argument('--p-dropout', type=float, default=0., help='Dropout')
     # endregion
-
-    # parser.add_argument('--num-adapt-epochs', type=int, default=1, help='Number of epochs to train model after every EM')
-
-    parser.add_argument('--num-samples-monitor', type=int, default=None)
-
-    parser.add_argument('--network-architecture', type=str, default='PreActResNet', help='PreActResNet or ResNet')
-
-    parser.add_argument('--ssl', dest='ssl', action='store_true')
-    parser.add_argument('--no-ssl', dest='ssl', action='store_false')
-    parser.set_defaults(ssl=False)
 
     parser.add_argument('--train', dest='train_flag', action='store_true')
     parser.add_argument('--test', dest='train_flag', action='store_false')
@@ -134,7 +121,7 @@ def get_features(state: train_state.TrainState, ds: tf.data.Dataset, batch_size:
         )
 
     # get feature dimension
-    for x, _ in tqdm(iterable=tfds.as_numpy(dataset=ds), desc=' features', leave=False, position=1):
+    for x, _ in tfds.as_numpy(dataset=ds):
         x = jnp.array(object=x) / 255.
         features, _ = feature_fn(
             model=state.model,
@@ -151,7 +138,7 @@ def get_features(state: train_state.TrainState, ds: tf.data.Dataset, batch_size:
     start_idx = 0
     for x, _ in tqdm(
         iterable=tfds.as_numpy(dataset=ds),
-        desc='Extract features',
+        desc=' features',
         leave=False,
         position=1
     ):
@@ -170,12 +157,11 @@ def get_features(state: train_state.TrainState, ds: tf.data.Dataset, batch_size:
     return xb
 
 
-def get_knn_indices(xb: np.ndarray, sample_indices: np.ndarray, num_nn: chex.Numeric) -> np.ndarray:
+def get_knn_indices(xb: np.ndarray, num_nn: chex.Numeric) -> np.ndarray:
     """find the indices of k-nearest neighbours
 
     Args:
         xb: the matrix where each row contains feature vector of one datum
-        sample_indices: the original indices of the samples (w.r.t. whole dataset)
         args:
 
     Returns:
@@ -187,7 +173,9 @@ def get_knn_indices(xb: np.ndarray, sample_indices: np.ndarray, num_nn: chex.Num
     index_id_map = faiss.IndexIDMap(index_flat)  # translates ids when adding and searching
     gpu_index_flat = faiss.index_cpu_to_gpu(provider=res, device=0, index=index_id_map)  # make it into a gpu index
 
-    gpu_index_flat.add_with_ids(xb, sample_indices)  # add vectors to the index
+    ids = np.arange(stop=xb.shape[0])
+
+    gpu_index_flat.add_with_ids(xb, ids)  # add vectors to the index
 
     # start the nearest-neighbour search
     _, index_matrix = gpu_index_flat.search(x=xb, k=num_nn + 1)  # adding 1 is because the return includes the sample itself
@@ -349,7 +337,6 @@ def relabel_data(
         log_mult_prob: chex.Array,
         nn_idx: chex.Array,
         coding_matrix: chex.Array,
-        sample_indices: chex.Array,
         args: argparse.Namespace) -> tuple[chex.Array, chex.Array]:
     """Perform EM to infer the p(y | x) and p(yhat | x, y)
     In this implementation, both p(y | x) and p(yhat | x, y) are sparse tensors
@@ -362,24 +349,23 @@ def relabel_data(
         nn_idx: a matrix where each row contains the indices of nearest-neighbours corresponding to row (sample) id  (N, K)
         coding_matrix: a matrix where each row contains the coding coefficient (normalised similarity)  (N, K)
         args: contains configuration parameters
-        sample_indices: a 1-d vector (array) containing indices of samples considered
 
     Returns:
         p_y: a sparse matrix where each row is p(y | x)  # (N, C)
         mult_prob: a sparse 3-d tensor where each matrix is p(yhat | x, y)  # (N, C , C)
     """
+    num_samples = log_p_y.shape[0]
+
     # initialize new p(y | x) and p(yhat | x, y)
     log_p_y_new = log_p_y + 0.
     log_mult_prob_new = log_mult_prob + 0.
 
-    data_loader = tf.data.Dataset.from_tensor_slices(tensors=sample_indices)
+    data_loader = tf.data.Dataset.from_tensor_slices(
+        tensors=jnp.arange(start=0, stop=num_samples, step=1)
+    )
     data_loader = data_loader.batch(batch_size=args.batch_size_em)
 
-    current_index = 0
     for indices in tqdm(iterable=tfds.as_numpy(dataset=data_loader), desc=' re-label', leave=False, position=1):
-        # track sample size
-        batch_size_ = indices.size
-
         # extract the corresponding noisy labels
         log_p_y_ = log_p_y[indices]  # (B, C)
         log_mult_prob_ = log_mult_prob[indices]  # (B, C, C)
@@ -388,7 +374,7 @@ def relabel_data(
         log_nn_coding = jnp.log(coding_matrix[indices])  # (B, K)
 
         # region APPROXIMATE p(y | x) through nearest-neighbours
-        nn_idx_ = nn_idx[current_index:(current_index + batch_size_)]
+        nn_idx_ = nn_idx[indices]
         log_p_y_nn = log_p_y[nn_idx_]  # (B, K, C)
         log_mult_prob_nn = log_mult_prob[nn_idx_]  # (B, K, C, C)
         log_mult_prob_nn = jnp.reshape(a=log_mult_prob_nn, newshape=(log_mult_prob_nn.shape[0], -1, log_mult_prob_nn.shape[-1]))  # (B, K*C, C)
@@ -411,15 +397,12 @@ def relabel_data(
             args=args
         )
 
-        if jnp.any(a=jnp.isnan(log_p_y_temp)):
-            raise ValueError('NaN is detected after running EM')
+        # if jnp.any(a=jnp.isnan(log_p_y_temp)):
+        #     raise ValueError('NaN is detected after running EM')
 
         # update the noisy labels
         log_p_y_new = log_p_y_new.at[indices].set(values=log_p_y_temp)
         log_mult_prob_new = log_mult_prob_new.at[indices].set(values=log_mult_prob_temp)
-
-        # update current index
-        current_index = current_index + batch_size_
 
     return log_p_y_new, log_mult_prob_new
 
@@ -581,7 +564,7 @@ def main() -> None:
     # load training dataset
     dataset_train, labels = image_folder_label_csv(
         root_dir=os.path.join(args.dataset_root, 'train'),
-        csv_path=os.path.join(args.dataset_root, 'split', 'label_noise_{:.1f}'.format(args.noise_rate)),
+        csv_path=os.path.join(args.dataset_root, 'split', args.label_filename),
         sample_indices=None,
         image_shape=args.img_shape
     )
@@ -726,12 +709,12 @@ def main() -> None:
         )
 
         state_1 = restored['state_1']['state']
-        log_p_y_1 = restored['state_1']['log_p_y']
-        log_mult_prob_1 = restored['state_1']['log_mult_prob']
+        log_p_y_1 = jnp.asarray(a=restored['state_1']['log_p_y'])
+        log_mult_prob_1 = jnp.asarray(a=restored['state_1']['log_mult_prob'])
 
         state_2 = restored['state_2']['state']
-        log_p_y_2 = restored['state_2']['log_p_y']
-        log_mult_prob_2 = restored['state_2']['log_mult_prob']
+        log_p_y_2 = jnp.asarray(restored['state_2']['log_p_y'])
+        log_mult_prob_2 = jnp.asarray(a=restored['state_2']['log_mult_prob'])
 
         del checkpoint_example
         del restored
@@ -788,7 +771,7 @@ def main() -> None:
                     """
                     sub_dataset, _ = image_folder_label_csv(
                         root_dir=os.path.join(args.dataset_root, 'train'),
-                        csv_path=os.path.join(args.dataset_root, 'split', 'label_noise_{:.1f}'.format(args.noise_rate)),
+                        csv_path=os.path.join(args.dataset_root, 'split', args.label_filename),
                         sample_indices=sample_indices_,
                         image_shape=args.img_shape
                     )
@@ -801,7 +784,7 @@ def main() -> None:
                     features = np.asanyarray(a=features)
 
                     # find K nearest-neighbours
-                    knn_indices_ = get_knn_indices(xb=features, sample_indices=sample_indices_, num_nn=args.k)
+                    knn_indices_ = get_knn_indices(xb=features, num_nn=args.k)
 
                     # calculate coding mtrices
                     coding_matrix_ = get_batch_local_affine_coding(samples=features, knn_indices=knn_indices_)
@@ -812,23 +795,26 @@ def main() -> None:
                         log_mult_prob=log_mult_prob_,
                         nn_idx=knn_indices_,
                         coding_matrix=coding_matrix_,
-                        sample_indices=sample_indices_,
                         args=args
                     )
 
-                log_p_y_1, log_mult_prob_1 = relabel_data_wrapper(
+                log_p_y_1_temp, log_mult_prob_1_temp = relabel_data_wrapper(
                     state_=state_1,
                     sample_indices_=sample_indices_1,
-                    log_p_y_=log_p_y_1,
-                    log_mult_prob_=log_mult_prob_1
+                    log_p_y_=log_p_y_1[sample_indices_1],
+                    log_mult_prob_=log_mult_prob_1[sample_indices_1]
                 )
+                log_p_y_1 = log_p_y_1.at[sample_indices_1].set(values=log_p_y_1_temp)
+                log_mult_prob_1 = log_mult_prob_1.at[sample_indices_1].set(values=log_mult_prob_1_temp)
 
-                log_p_y_2, log_mult_prob_2 = relabel_data_wrapper(
+                log_p_y_2_temp, log_mult_prob_2_temp = relabel_data_wrapper(
                     state_=state_2,
                     sample_indices_=sample_indices_2,
-                    log_p_y_=log_p_y_2,
-                    log_mult_prob_=log_mult_prob_2
+                    log_p_y_=log_p_y_2[sample_indices_2],
+                    log_mult_prob_=log_mult_prob_2[sample_indices_2]
                 )
+                log_p_y_2 = log_p_y_1.at[sample_indices_2].set(values=log_p_y_2_temp)
+                log_mult_prob_2 = log_mult_prob_2.at[sample_indices_2].set(values=log_mult_prob_2_temp)
 
             # region TRAIN models on relabelled data
             state_1 = train_model(
