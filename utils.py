@@ -1,5 +1,15 @@
 import jax
 from jax import numpy as jnp
+from jax.experimental import sparse
+
+import flax
+from flax import linen as nn
+from flax.training import train_state
+
+from jaxopt import OSQP
+import optax
+
+from clu import metrics
 
 import dm_pix
 
@@ -7,7 +17,24 @@ from tensorflow_probability.substrates import jax as tfp
 
 import chex
 
+import tensorflow_datasets as tfds
+import tensorflow as tf
+
+import faiss  # facebook similarity search
+
+import numpy as np
+import os
+
 from functools import partial
+
+import aim
+
+import argparse
+
+from typing import Any
+from tqdm import tqdm
+
+from data_utils import image_folder_label_csv
 
 
 @jax.jit
@@ -119,3 +146,428 @@ def augment_an_image(key: jax.random.PRNGKey, image: chex.Array, image_shape: tu
     image = dm_pix.random_flip_left_right(key=key, image=image)
 
     return image
+
+
+def sub_sparse_matrix_from_row_indices(mat: sparse.BCOO, indices: chex.Array, n_batch: int = 1) -> sparse.BCOO:
+    """
+    """
+    m = mat[indices]
+    m = sparse.bcoo_update_layout(mat=m, n_batch=n_batch)
+    m = sparse.bcoo_sum_duplicates(mat=m)
+
+    return m
+
+
+def parse_arguments() -> argparse.Namespace:
+    """
+    """
+    parser = argparse.ArgumentParser(description='')
+
+    parser.add_argument('--experiment-name', type=str, help='')
+
+    parser.add_argument('--dataset-root', type=str, default=None, help='Path to the folder containing train and test sets')
+    parser.add_argument('--logdir', type=str, default='logs', help='Folder to store logs')
+
+    parser.add_argument('--img-shape', action='append', help='e.g., 32 32 3 or 224 224 3')
+    parser.add_argument('--num-samples', type=int, default=None, help='Number of samples in each iteration. None is whole dataset')
+    parser.add_argument('--C0', type=int, help='Number of sparse classes')
+
+    parser.add_argument('--label-filenames', action='append', help='Filenames of images and labels in the split folder')
+
+    parser.add_argument('--k', type=int, help='Number of nearest neighbours')
+    parser.add_argument('--num-noisy-labels-per-sample', type=int, help='Number of noisy labels per training sample')
+    parser.add_argument('--num-multinomial-samples', type=int, default=5_000, help='Number of multinomial samples used in EM')
+
+    # region EM-related
+    parser.add_argument('--mu', type=float, help='Percentage between nearest neighbors and itself')
+
+    parser.add_argument('--batch-size-em', type=int, help='Batch size of samples are EM-ed simultaneously')
+
+    parser.add_argument('--alpha', type=float, default=1., help='Dirichlet prior parameter for p_y')
+    parser.add_argument('--beta', type=float, default=1., help='Dirichlet prior parameter for p(y_hat | x, y)')
+    parser.add_argument('--num-em-iter', type=int, default=5, help='Number of EM iterations')
+    # endregion
+
+    # region PYTORCH
+    parser.add_argument('--batch-size', type=int, help='Batch size')
+    parser.add_argument('--lr', type=float, help='Learning rate')
+    parser.add_argument('--num-warmup', type=int, help='Number of epochs to warm up')
+    parser.add_argument('--num-epochs', type=int, help='Number of epochs')
+    # endregion
+
+    parser.add_argument('--train', dest='train_flag', action='store_true')
+    parser.add_argument('--test', dest='train_flag', action='store_false')
+    parser.set_defaults(train_flag=True)
+
+    parser.add_argument('--tqdm', dest='tqdm_flag', action='store_true')
+    parser.add_argument('--no-tqdm', dest='tqdm_flag', action='store_false')
+    parser.set_defaults(tqdm_flag=True)
+
+    parser.add_argument('--resume', dest='resume', action='store_true')
+    parser.set_defaults(resume=False)
+    parser.add_argument('--run-hash-id', type=str, default=None, help='Hash id of the run to resume')
+
+    parser.add_argument('--jax-mem-fraction', type=float, default=0.1, help='Percentage of GPU memory allocated for Jax')
+
+    args = parser.parse_args()
+
+    return args
+
+
+def get_features(state: train_state.TrainState, ds: tf.data.Dataset, batch_size: chex.Numeric) -> chex.Array:
+    """Extract features of data
+
+    Args:
+        state: a data-class storing model-related parameters
+        ds: the dataset of interest
+        batch_size:
+
+    Returns:
+        xb: the extracted features
+    """
+    # setup a function to extract features
+    def feature_fn(
+        model: nn.Module,
+        params: flax.core.frozen_dict.FrozenDict,
+        x: chex.Array
+    ):
+        return model.apply(
+            variables=params,
+            x=x,
+            mutable=['batch_stats'],
+            method=lambda module, x: module.features(x=x, train=False)
+        )
+
+    # get feature dimension
+    for x, _ in tfds.as_numpy(dataset=ds):
+        x = jnp.array(object=x) / 255.
+        features, _ = feature_fn(
+            model=state.model,
+            params={'params': state.params, 'batch_stats': state.batch_stats},
+            x=x
+        )
+        break
+
+    xb = jnp.empty(shape=(len(ds), features.shape[-1]))  # (N, D)
+
+    ds = ds.batch(batch_size=batch_size)
+
+    # region EXTRACT FEATURES
+    start_idx = 0
+    for x, _ in tqdm(
+        iterable=tfds.as_numpy(dataset=ds),
+        desc=' features',
+        leave=False,
+        position=1
+    ):
+        x = jnp.array(object=x) / 255.
+        features, _ = feature_fn(
+            model=state.model,
+            params={'params': state.params, 'batch_stats': state.batch_stats},
+            x=x
+        )
+
+        end_idx = start_idx + x.shape[0]
+        xb = xb.at[start_idx:end_idx].set(features)
+        start_idx = end_idx
+    # endregion
+
+    return xb
+
+
+def get_knn_indices(xb: np.ndarray, num_nn: chex.Numeric) -> np.ndarray:
+    """find the indices of k-nearest neighbours
+
+    Args:
+        xb: the matrix where each row contains feature vector of one datum
+        args:
+
+    Returns:
+        index_matrix: matrix containing indices of nearest neighbours
+    """
+    res = faiss.StandardGpuResources()  # use a single GPU
+
+    index_flat = faiss.IndexFlatL2(xb.shape[-1])  # build a flat (CPU) index
+    index_id_map = faiss.IndexIDMap(index_flat)  # translates ids when adding and searching
+    gpu_index_flat = faiss.index_cpu_to_gpu(provider=res, device=0, index=index_id_map)  # make it into a gpu index
+
+    ids = np.arange(stop=xb.shape[0])
+
+    gpu_index_flat.add_with_ids(xb, ids)  # add vectors to the index
+
+    # start the nearest-neighbour search
+    _, index_matrix = gpu_index_flat.search(x=xb, k=num_nn + 1)  # adding 1 is because the return includes the sample itself
+
+    return index_matrix[:, 1:]  # exclude the first element which is the sample itself
+
+
+def solve_local_affine_coding(datum: chex.Array, knn: chex.Array) -> jax.Array:
+    """A JAX-jittable method to calculate the local affine coding of a single sample
+    from its nearest neighbours
+    The optimization is an operator-splitted quadratic program (OSQP):
+    min 0.5 * x^T Q x + c^T x subject to Gx <= h, Ax = b.
+
+    Args:
+        datum: the data vector of the sample  # (d,)
+        knn: the matrix where each row consists of K nearest-neighbour indices  # (K, d)
+
+    Returns:
+        x: the coding vector
+    """
+    matrix_Q: jax.Array
+    vector_c: jax.Array
+    matrix_G: jax.Array
+    vector_h: jax.Array
+    matrix_A: jax.Array
+    vector_b: jax.Array
+
+    # parameters of objective functions
+    matrix_Q = jnp.matmul(a=knn, b=jnp.transpose(a=knn))  # (K, K)
+    vector_c = - jnp.matmul(a=knn, b=datum)  # (K,)
+
+    # inequality
+    matrix_G = -jnp.identity(n=knn.shape[0])  # (K, K)
+    vector_h = jnp.zeros_like(a=vector_c)  # (K,)
+
+    # equality
+    matrix_A = jnp.ones_like(a=vector_c)[None, :]  # (K,)
+    vector_b = jnp.array(object=[1.])  # scalar
+
+    # declare the OSQP object
+    qp = OSQP(maxiter=1000, tol=1e-6)
+    sol = qp.run(params_obj=(matrix_Q, vector_c), params_ineq=(matrix_G, vector_h), params_eq=(matrix_A, vector_b))
+
+    x = sol.params.primal
+
+    # the OSQP stops at a certain point and the solution might be closed,
+    # but not exact. Thus, we need to enforce the constrains:
+    # x = jnp.abs(x)  # non-negative number
+    x = jax.nn.relu(x)
+    x = x / jnp.sum(a=x, axis=-1)  # sum to 1
+
+    return x
+
+
+def get_local_affine_coding(datum: chex.Array, knn_index: chex.Array, data: chex.Array) -> chex.Array:
+    """A JAX-based method to calculate the local affine coding of a single sample
+    from its nearest neighbours
+    The optimization is an operator-splitted quadratic program (OSQP):
+    min 0.5 * x^T Q x + c^T x subject to Gx <= h, Ax = b.
+
+    Args:
+        datum: the data vector of the sample  # (d,)
+        knn_index: vector of K nearest-neighbour indices  # (K,)
+        data: all the samples considered  (N, d)
+
+    Returns:
+        x: the coding vector
+    """
+    # get K nearest-neighbours
+    knn = data[knn_index]  # (K, d)
+
+    return solve_local_affine_coding(datum=datum, knn=knn)
+
+
+def get_batch_local_affine_coding(samples: np.ndarray, knn_indices: np.ndarray) -> chex.Array:
+    """This method calculates the local affine coding of a batch of samples
+    The optimization is an operator-splitted quadratic program (OSQP):
+    min 0.5 * x^T Q x + c^T x subject to Gx <= h, Ax = b.
+
+    Args:
+        samples: a batch of data vectors  # (N, d)
+        knn: the tensors of K nearest-neighbour of the batch of samples  # (N, K, d)
+
+    Returns:
+        x: the batch of coding vectors  # (N, K)
+    """
+    # convert the matrix of nearest-neighbours to jax array
+    samples_jax = jnp.asarray(a=samples)  # (N, d)
+    knn_indices_jax = jnp.asarray(a=knn_indices)  # (N, K, d)
+
+    get_LAC_partial = partial(get_local_affine_coding, data=samples_jax)
+    auto_batch_LAC = jax.vmap(fun=get_LAC_partial, in_axes=0, out_axes=0)
+
+    x = auto_batch_LAC(samples_jax, knn_indices_jax)  # (N, K)
+
+    return x
+
+
+def get_p_y(
+        log_mixture_coefficients: chex.Array,
+        log_multinomial_probs: chex.Array,
+        args: argparse.Namespace) -> tuple[chex.Array, chex.Array]:
+    """Infer the noisy label distribution as a C-multinomial mixture model
+        using EM. The data is generated from a (K + 1)C-multinomial mixture
+        models obtained via nearest-neighbours
+
+    Args:
+        log_mixture_coefficients:
+        log_multinomial_probs: the probability matrix containing probability
+            vectors of (K + 1)C multinomial distributions
+        args: object storing configuration parameters
+
+    Returns:
+        log_p_y:
+        log_mult_prob: a matrix containing the probability vectors of
+            C-multinomial distributions
+    """
+    mixture_distribution = tfp.distributions.Categorical(
+        logits=log_mixture_coefficients,
+        validate_args=True,
+        allow_nan_stats=False
+    )
+    component_distribution = tfp.distributions.Multinomial(
+        total_count=args.num_noisy_labels_per_sample,
+        logits=log_multinomial_probs,
+        validate_args=True
+    )
+
+    mult_mixture = tfp.distributions.MixtureSameFamily(
+        mixture_distribution=mixture_distribution,
+        components_distribution=component_distribution
+    )
+
+    # generate noisy labels
+    rng = np.random.default_rng(seed=None)
+    yhat = mult_mixture.sample(
+        sample_shape=(args.num_multinomial_samples,),
+        seed=jax.random.PRNGKey(seed=rng.integers(low=0, high=2**63))
+    )  # (sample_shape, N, C)
+    yhat = jnp.transpose(a=yhat, axes=(1, 0, 2))  # (N, sample_shape, C)
+
+    log_p_y, log_mult_prob = EM_for_mm(
+        y=yhat,
+        batch_size_=args.batch_size_em,
+        n_=args.num_multinomial_samples,
+        d_=args.num_classes,
+        num_noisy_labels_per_sample=args.num_noisy_labels_per_sample,
+        num_em_iter=args.num_em_iter,
+        alpha=args.alpha,
+        beta=args.beta
+    )
+
+    return log_p_y, log_mult_prob
+
+
+def cross_entropy_loss(
+    params: flax.core.frozen_dict.FrozenDict,
+    batch_stats: flax.core.frozen_dict.FrozenDict,
+    model: nn.Module,
+    x: jax.Array,
+    y: jax.Array,
+    train: bool
+) -> tuple[jax.Array, jax.Array]:
+    """
+    """
+    logit, updates = model.apply(
+        variables={'params': params, 'batch_stats': batch_stats},
+        x=x,
+        train=train,
+        mutable=['batch_stats']
+    )  # return a tuple(loss, mutable vars)
+
+    loss = optax.softmax_cross_entropy(logits=logit, labels=y)
+
+    loss = jnp.mean(a=loss, axis=0)
+
+    return loss, updates
+
+
+def evaluate(state: train_state.TrainState, ds: tf.data.Dataset) -> chex.Array:
+    """Evaluate the model on the given dataset
+
+    Args:
+        state: train_state includes params and model
+        ds: the batched dataset of interest
+
+    Returns:
+        prediction accuracy on the given dataset
+    """
+    accuracy = metrics.Accuracy(total=jnp.array(0.), count=jnp.array(0))
+
+    for image, label in tqdm(iterable=tfds.as_numpy(dataset=ds), desc=' validate', position=2, leave=False):
+        x = jnp.array(object=image) / 255.
+        y = jnp.array(label)
+
+        logits, batch_stats = state.model.apply(variables={'params': state.params, 'batch_stats': state.batch_stats}, x=x, train=False, mutable=['batch_stats'])
+        accuracy = accuracy.merge(other=metrics.Accuracy.from_model_output(logits=logits, labels=y))
+
+    return accuracy.compute()
+
+
+def train_model(state: train_state.TrainState, dataset_train: tf.data.Dataset, p_y: chex.Array, num_epochs: int, aim_run: aim.Run, args: argparse.Namespace) -> train_state.TrainState:
+    """
+    """
+    # define loss function
+    loss_grad_fn = partial(cross_entropy_loss, model=state.model, train=True)
+    loss_grad_fn = jax.value_and_grad(fun=loss_grad_fn, argnums=0, has_aux=True)
+    loss_grad_fn = jax.jit(fun=loss_grad_fn)
+
+    # generate another dataset for labels
+    p_y_dataset = tf.data.Dataset.from_tensor_slices(tensors=p_y)
+    assert len(p_y_dataset) == len(dataset_train), \
+        f'Dataset lengths mismatch: len(p_y_dataset) = {len(p_y_dataset)}, while len(dataset_train) = {len(dataset_train)}'
+    dataset_noisy_labels = tf.data.Dataset.zip(dataset_train, p_y_dataset)
+    dataset_noisy_labels = dataset_noisy_labels.shuffle(buffer_size=args.total_num_samples, reshuffle_each_iteration=True)
+    dataset_noisy_labels = dataset_noisy_labels.batch(batch_size=args.batch_size)
+    dataset_noisy_labels = dataset_noisy_labels.prefetch(tf.data.AUTOTUNE)
+
+    # numpy random generator
+    rng = np.random.default_rng(seed=None)
+    image_augmentation_fn = jax.vmap(
+        fun=partial(augment_an_image, image_shape=args.img_shape),
+        in_axes=(0, 0)
+    )
+
+    # testing dataset
+    dataset_test, _ = image_folder_label_csv(
+        root_dir=os.path.join(args.dataset_root, 'test'),
+        csv_path=os.path.join(args.dataset_root, 'split', 'clean_validation'),
+        sample_indices=None,
+        image_shape=args.img_shape
+    )
+    dataset_test = dataset_test.batch(batch_size=args.batch_size)
+
+    for _ in tqdm(iterable=range(num_epochs), desc='train', leave=False, position=1):
+
+        # define metrics
+        loss_accumulate = metrics.Average(total=jnp.array(0.), count=jnp.array(0))
+
+        for (x, y), yhat in tqdm(iterable=tfds.as_numpy(dataset=dataset_noisy_labels), desc=' epoch', leave=False, position=2):
+            x = jnp.array(object=x, dtype=jnp.float32) / 255.
+            yhat = jnp.array(object=yhat)
+
+            # data augmentation
+            key = jax.vmap(fun=jax.random.PRNGKey)(rng.integers(low=0, high=2**63, size=y.size))
+            x = image_augmentation_fn(key, x)
+
+            (loss, batch_stats_new), grads = loss_grad_fn(state.params, batch_stats=state.batch_stats, x=x, y=yhat)
+
+            # stochastic gradient Langevin dynamics
+            lr = args.lr_schedule_fn(state.step)
+            grads = jax.tree_map(
+                f=lambda x: x + jnp.sqrt(2 * lr) / len(dataset_noisy_labels) * jax.random.normal(key=key[0], shape=x.shape),
+                tree=grads
+            )
+
+            state = state.apply_gradients(grads=grads)
+            state = state.replace(batch_stats=batch_stats_new['batch_stats'])
+
+            loss_accumulate = metrics.Average.merge(self=loss_accumulate, other=metrics.Average.from_model_output(values=loss))
+
+        aim_run.track(value=loss_accumulate.compute(), name='Loss', context={'model': state.model_id})
+
+        # region EVALUATION
+        acc = evaluate(state=state, ds=dataset_test)
+        aim_run.track(value=acc, name='Accuracy', context={'model': state.model_id})
+        # endregion
+
+    return state
+
+
+class TrainState(train_state.TrainState):
+    """A data-class storing model's parameters, optimizer and others
+    """
+    batch_stats: Any
+    model: nn.Module
+    model_id: int
