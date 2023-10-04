@@ -308,7 +308,7 @@ def main() -> None:
             params=state_.params,
             batch_stats=state_.batch_stats,
             model=model,
-            model_id=state_.model_id,
+            model_id=state_.model_id.item(),
             tx=state_.tx
         ) for state_ in [state_1, state_2]]
     else:
