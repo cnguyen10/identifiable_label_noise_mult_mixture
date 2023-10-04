@@ -594,7 +594,6 @@ def main() -> None:
                     state=state_1,
                     sample_indices=sample_indices_1
                 )
-                break
 
                 log_p_y_2, log_mult_prob_2 = update_mult_mixture(
                     log_p_y=log_p_y_2,
