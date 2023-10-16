@@ -27,7 +27,8 @@ import chex
 
 from PreactResnet import ResNet18
 from utils import parse_arguments, get_features, get_knn_indices, \
-    get_p_y, get_batch_local_affine_coding, train_model, TrainState
+    get_p_y, get_batch_local_affine_coding, train_model, TrainState, \
+    add_Langevin_dynamics_noise
 from data_utils import image_folder_label_csv
 
 
@@ -271,7 +272,7 @@ def main() -> None:
         total=len(label_dataset),
         position=1
     ):
-        key = jax.random.PRNGKey(seed=random.randint(a=0, b=1e6))
+        key = jax.random.PRNGKey(seed=random.randint(a=0, b=1_000))
         noise = jax.random.uniform(key=key, shape=(ids.size, args.num_classes))  # (B, C)
 
         # convert integer numbers to one-hot vectors
@@ -327,6 +328,10 @@ def main() -> None:
 
     del labels
     del label_dataset
+    del log_p_y_data_temp
+    del log_p_y_data
+    del log_p_y_indices
+    del log_mult_prob_temp
     # endregion
 
     # region MODEL
@@ -334,7 +339,7 @@ def main() -> None:
 
     args.lr_schedule_fn = optax.cosine_decay_schedule(
         init_value=args.lr,
-        decay_steps=500*args.num_epochs
+        decay_steps=10_000
     )
 
     def initialize_train_state(model_id: int) -> train_state.TrainState:
@@ -344,7 +349,26 @@ def main() -> None:
         )
         x = jax.random.normal(key1, (1, 32, 32, 3))  # Dummy input data
         params = model.init(rngs=key2, x=x, train=False)
-        tx = optax.sgd(learning_rate=args.lr_schedule_fn, momentum=0.9)  # define an optimizer
+
+        # add L2 regularisation(aka weight decay)
+        weight_decay = optax.masked(
+            inner=optax.add_decayed_weights(
+                weight_decay=0.0005,
+                mask=None
+            ),
+            mask=lambda p: jax.tree_util.tree_map(lambda x: x.ndim != 1, p)
+        )
+
+        # define an optimizer
+        tx = optax.chain(
+            add_Langevin_dynamics_noise(
+                lr_schedule_fn=args.lr_schedule_fn,
+                len_dataset=args.total_num_samples,
+                seed=random.randint(a=0, b=1_000)
+            ),
+            weight_decay,
+            optax.sgd(learning_rate=args.lr_schedule_fn, momentum=0.9)
+        )
 
         state = TrainState.create(
             apply_fn=model.apply,
@@ -530,11 +554,10 @@ def main() -> None:
                         ds=sub_dataset,
                         batch_size=args.batch_size
                     )
-                    features = np.asanyarray(a=features)
 
                     # find K nearest-neighbours
                     knn_indices_ = get_knn_indices(
-                        xb=features,
+                        xb=np.array(object=features),
                         num_nn=args.k
                     )
 
@@ -601,6 +624,7 @@ def main() -> None:
                     state=state_2,
                     sample_indices=sample_indices_2
                 )
+                break
 
             # region TRAIN models on relabelled data
             state_1 = train_model(
@@ -610,7 +634,7 @@ def main() -> None:
                     args=(jnp.exp(log_p_y_2.data), log_p_y_2.indices),
                     shape=log_p_y_2.shape
                 ).todense(),
-                num_epochs=5,
+                num_epochs=1,
                 aim_run=aim_run,
                 args=args
             )
@@ -621,7 +645,7 @@ def main() -> None:
                     args=(jnp.exp(log_p_y_1.data), log_p_y_1.indices),
                     shape=log_p_y_1.shape
                 ).todense(),
-                num_epochs=5,
+                num_epochs=1,
                 aim_run=aim_run,
                 args=args
             )

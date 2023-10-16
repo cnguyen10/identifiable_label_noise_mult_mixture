@@ -31,7 +31,7 @@ import aim
 
 import argparse
 
-from typing import Any
+from typing import Any, Callable, NamedTuple
 from tqdm import tqdm
 
 from data_utils import image_folder_label_csv
@@ -543,13 +543,6 @@ def train_model(state: train_state.TrainState, dataset_train: tf.data.Dataset, p
 
             (loss, batch_stats_new), grads = loss_grad_fn(state.params, batch_stats=state.batch_stats, x=x, y=yhat)
 
-            # stochastic gradient Langevin dynamics
-            lr = args.lr_schedule_fn(state.step)
-            grads = jax.tree_map(
-                f=lambda x: x + jnp.sqrt(2 * lr) / len(dataset_noisy_labels) * jax.random.normal(key=key[0], shape=x.shape),
-                tree=grads
-            )
-
             state = state.apply_gradients(grads=grads)
             state = state.replace(batch_stats=batch_stats_new['batch_stats'])
 
@@ -571,3 +564,45 @@ class TrainState(train_state.TrainState):
     batch_stats: Any
     model: nn.Module
     model_id: int
+
+
+class AddNoiseState(NamedTuple):
+    """State for adding gradient noise. Contains a count for annealing."""
+    count: chex.Array
+    rng_key: chex.PRNGKey
+
+
+def add_Langevin_dynamics_noise(
+    lr_schedule_fn: Callable,
+    len_dataset: int,
+    seed: int
+) -> optax._src.base.GradientTransformation:
+    """Adopted from optax.add_noise. This is to perform stochastic gradient
+    Langevin dynamics.
+    """
+
+    def init_fn(params):
+        del params
+        return AddNoiseState(
+            count=jnp.zeros([], jnp.int32),
+            rng_key=jax.random.PRNGKey(seed)
+        )
+
+    def update_fn(updates, state, params=None):
+        del params
+        num_vars = len(jax.tree_util.tree_leaves(updates))
+        treedef = jax.tree_util.tree_structure(updates)
+        count_inc = optax._src.numerics.safe_int32_increment(state.count)
+        variance = 2 * lr_schedule_fn(count_inc)
+        standard_deviation = jnp.sqrt(variance) / len_dataset
+        all_keys = jax.random.split(state.rng_key, num=num_vars + 1)
+        noise = jax.tree_util.tree_map(
+            lambda g, k: jax.random.normal(k, shape=g.shape, dtype=g.dtype),
+            updates, jax.tree_util.tree_unflatten(treedef, all_keys[1:])
+        )
+        updates = jax.tree_util.tree_map(
+            lambda g, n: g + standard_deviation.astype(g.dtype) * n,
+            updates, noise)
+        return updates, AddNoiseState(count=count_inc, rng_key=all_keys[0])
+
+    return optax._src.base.GradientTransformation(init_fn, update_fn)

@@ -28,7 +28,8 @@ import chex
 
 from PreactResnet import ResNet18
 from utils import parse_arguments, get_features, get_knn_indices, get_p_y, \
-    get_batch_local_affine_coding, train_model, TrainState
+    get_batch_local_affine_coding, train_model, TrainState, \
+    add_Langevin_dynamics_noise
 from data_utils import image_folder_label_csv
 
 
@@ -61,7 +62,8 @@ def relabel_data(
     log_mult_prob_new = log_mult_prob + 0.
 
     data_loader = tf.data.Dataset.from_tensor_slices(
-        tensors=jnp.arange(start=0, stop=num_samples, step=1)
+        # tensors=jnp.arange(start=0, stop=num_samples, step=1)
+        tensors=tf.range(start=0, limit=num_samples, delta=1)
     )
     data_loader = data_loader.batch(batch_size=args.batch_size_em)
 
@@ -196,7 +198,7 @@ def main() -> None:
 
     args.lr_schedule_fn = optax.cosine_decay_schedule(
         init_value=args.lr,
-        decay_steps=500*args.num_epochs
+        decay_steps=10_000
     )
 
     def initialize_train_state(model_id: int) -> train_state.TrainState:
@@ -206,7 +208,26 @@ def main() -> None:
         )
         x = jax.random.normal(key1, (1, 32, 32, 3))  # Dummy input data
         params = model.init(rngs=key2, x=x, train=False)
-        tx = optax.sgd(learning_rate=args.lr_schedule_fn, momentum=0.9)  # define an optimizer
+
+        # add L2 regularisation(aka weight decay)
+        weight_decay = optax.masked(
+            inner=optax.add_decayed_weights(
+                weight_decay=0.0005,
+                mask=None
+            ),
+            mask=lambda p: jax.tree_util.tree_map(lambda x: x.ndim != 1, p)
+        )
+
+        # define an optimizer
+        tx = optax.chain(
+            add_Langevin_dynamics_noise(
+                lr_schedule_fn=args.lr_schedule_fn,
+                len_dataset=args.total_num_samples,
+                seed=random.randint(a=0, b=1_000)
+            ),
+            weight_decay,
+            optax.sgd(learning_rate=args.lr_schedule_fn, momentum=0.9)
+        )
 
         state = TrainState.create(
             apply_fn=model.apply,
@@ -363,13 +384,18 @@ def main() -> None:
                         ds=sub_dataset,
                         batch_size=args.batch_size
                     )
-                    features = np.asanyarray(a=features)
 
                     # find K nearest-neighbours
-                    knn_indices_ = get_knn_indices(xb=features, num_nn=args.k)
+                    knn_indices_ = get_knn_indices(
+                        xb=np.array(features),
+                        num_nn=args.k
+                    )
 
                     # calculate coding mtrices
-                    coding_matrix_ = get_batch_local_affine_coding(samples=features, knn_indices=knn_indices_)
+                    coding_matrix_ = get_batch_local_affine_coding(
+                        samples=features,
+                        knn_indices=knn_indices_
+                    )
 
                     # run EM and re-label samples
                     return relabel_data(
@@ -380,23 +406,44 @@ def main() -> None:
                         args=args
                     )
 
-                log_p_y_1_temp, log_mult_prob_1_temp = relabel_data_wrapper(
-                    state_=state_1,
-                    sample_indices_=sample_indices_1,
-                    log_p_y_=log_p_y_1[sample_indices_1],
-                    log_mult_prob_=log_mult_prob_1[sample_indices_1]
-                )
-                log_p_y_1 = log_p_y_1.at[sample_indices_1].set(values=log_p_y_1_temp)
-                log_mult_prob_1 = log_mult_prob_1.at[sample_indices_1].set(values=log_mult_prob_1_temp)
+                def update_mult_mixture(
+                    log_p_y: chex.Array,
+                    log_mult_prob: chex.Array,
+                    state: dict,
+                    sample_indices: chex.Array
+                ) -> tuple[chex.Array, chex.Array]:
+                    """
+                    """
+                    log_p_y_temp, log_mult_prob_temp = relabel_data_wrapper(
+                        state_=state,
+                        sample_indices_=sample_indices,
+                        log_p_y_=log_p_y,
+                        log_mult_prob_=log_mult_prob
+                    )
 
-                log_p_y_2_temp, log_mult_prob_2_temp = relabel_data_wrapper(
-                    state_=state_2,
-                    sample_indices_=sample_indices_2,
-                    log_p_y_=log_p_y_2[sample_indices_2],
-                    log_mult_prob_=log_mult_prob_2[sample_indices_2]
+                    # update
+                    log_p_y = log_p_y.at[sample_indices].set(
+                        values=log_p_y_temp
+                    )
+                    log_mult_prob = log_mult_prob.at[sample_indices].set(
+                        values=log_mult_prob_temp
+                    )
+
+                    return log_p_y, log_mult_prob
+
+                log_p_y_1, log_mult_prob_1 = update_mult_mixture(
+                    log_p_y=log_p_y_1,
+                    log_mult_prob=log_mult_prob_1,
+                    state=state_1,
+                    sample_indices=sample_indices_1
                 )
-                log_p_y_2 = log_p_y_1.at[sample_indices_2].set(values=log_p_y_2_temp)
-                log_mult_prob_2 = log_mult_prob_2.at[sample_indices_2].set(values=log_mult_prob_2_temp)
+
+                log_p_y_2, log_mult_prob_2 = update_mult_mixture(
+                    log_p_y=log_p_y_2,
+                    log_mult_prob=log_mult_prob_2,
+                    state=state_2,
+                    sample_indices=sample_indices_2
+                )
 
             # region TRAIN models on relabelled data
             state_1 = train_model(
