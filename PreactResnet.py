@@ -20,21 +20,21 @@ class PreActBlock(nn.Module):
     def __call__(self, x: chex.Array, train: Optional[bool] = None) -> Any:
         train = nn.merge_param(name='train', a=self.train, b=train)
 
-        out = nn.BatchNorm()(x=x, use_running_average=not train)
-        out = nn.relu(x=out)
-
         if self.stride != 1 or self.in_planes != (self.expansion * self.planes):
             shortcut = nn.Conv(features=self.expansion * self.planes, kernel_size=(1, 1), strides=self.stride, use_bias=False)(inputs=x)
         else:
             shortcut = x
 
-        out = nn.Conv(features=self.planes, kernel_size=(3, 3), strides=self.stride, padding=1, use_bias=False)(inputs=out)
-        out = nn.BatchNorm()(x=out, use_running_average=not train)
+        out = nn.Conv(features=self.planes, kernel_size=(3, 3), strides=self.stride, padding=1, use_bias=False)(inputs=x)
+        out = nn.BatchNorm(use_running_average=not train)(x=out)
         out = nn.relu(x=out)
 
         out = nn.Conv(features=self.planes, kernel_size=(3, 3), strides=1, padding=1, use_bias=False)(inputs=out)
+        out = nn.BatchNorm(use_running_average=not train)(x=out)
 
         out = out + shortcut
+
+        out = nn.relu(x=out)
 
         return out
 
@@ -50,25 +50,25 @@ class PreActBottleneck(nn.Module):
     def __call__(self, x: chex.Array, train: Optional[bool] = None) -> chex.Array:
         train = nn.merge_param(name='train', a=self.train, b=train)
 
-        out = nn.BatchNorm()(x=x, use_running_average=not train)
-        out = nn.relu(x=out)
-
         if self.stride != 1 or self.in_planes != self.expansion * self.planes:
             shortcut = nn.Conv(features=self.expansion * self.planes, kernel_size=(1, 1), strides=self.stride, use_bias=False)(inputs=x)
         else:
             shortcut = x
 
-        out = nn.Conv(features=self.planes, kernel_size=(1, 1), strides=1, padding=0, use_bias=False)(inputs=out)
-
-        out = nn.BatchNorm()(x=out, use_running_average=not train)
+        out = nn.Conv(features=self.planes, kernel_size=(1, 1), strides=1, padding=0, use_bias=False)(inputs=x)
+        out = nn.BatchNorm(use_running_average=not train)(x=out)
         out = nn.relu(x=out)
+
         out = nn.Conv(features=self.planes, kernel_size=(3, 3), strides=self.stride, padding=1, use_bias=False)(inputs=out)
-
-        out = nn.BatchNorm()(x=out, use_running_average=not train)
+        out = nn.BatchNorm(use_running_average=not train)(x=out)
         out = nn.relu(x=out)
+
         out = nn.Conv(features=self.expansion * self.planes, kernel_size=(1, 1), use_bias=False)(inputs=out)
+        out = nn.BatchNorm(use_running_average=not train)(x=out)
 
         out = out + shortcut
+
+        out = nn.relu(x=out)
 
         return out
 
@@ -79,10 +79,15 @@ class PreActResNetFeature(nn.Module):
     block: PreActBlock | PreActBottleneck
     num_blocks: Sequence[int]
     in_planes: int = 64
+    train: bool | None = None
 
     @nn.compact
     def __call__(self, x: chex.Array, train: Optional[bool] = None) -> chex.Array:
+        train = nn.merge_param(name='train', a=self.train, b=train)
+
         out = nn.Conv(features=64, kernel_size=(3, 3), strides=1, padding=1, use_bias=False)(inputs=x)
+        out = nn.BatchNorm(use_running_average=not train)(x=out)
+        out = nn.relu(x=out)
 
         in_planes, layer1 = make_layer(block=self.block, in_planes=self.in_planes, planes=64, num_blocks=self.num_blocks[0], stride=1, train=train)
         in_planes, layer2 = make_layer(block=self.block, in_planes=in_planes, planes=128, num_blocks=self.num_blocks[1], stride=2, train=train)
