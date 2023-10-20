@@ -236,7 +236,6 @@ def main() -> None:
             apply_fn=model.apply,
             params=params['params'],
             batch_stats=params['batch_stats'],
-            model=model,
             model_id=model_id,
             tx=tx
         )

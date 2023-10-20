@@ -215,6 +215,20 @@ def parse_arguments() -> argparse.Namespace:
     return args
 
 
+@jax.jit
+def feature_step(state: train_state.TrainState, x: chex.Array) -> chex.Array:
+    """
+    """
+    features, _ = state.apply_fn(
+        variables={'params': state.params, 'batch_stats': state.batch_stats},
+        x=x,
+        mutable=['batch_stats'],
+        method=lambda module, x: module.features(x=x, train=False)
+    )
+
+    return features
+
+
 def get_features(state: train_state.TrainState, ds: tf.data.Dataset, batch_size: chex.Numeric) -> chex.Array:
     """Extract features of data
 
@@ -226,27 +240,10 @@ def get_features(state: train_state.TrainState, ds: tf.data.Dataset, batch_size:
     Returns:
         xb: the extracted features
     """
-    # setup a function to extract features
-    def feature_fn(
-        model: nn.Module,
-        params: flax.core.frozen_dict.FrozenDict,
-        x: chex.Array
-    ):
-        return model.apply(
-            variables=params,
-            x=x,
-            mutable=['batch_stats'],
-            method=lambda module, x: module.features(x=x, train=False)
-        )
-
     # get feature dimension
     for x, _ in tfds.as_numpy(dataset=ds):
-        x = jnp.array(object=x) / 255.
-        features, _ = feature_fn(
-            model=state.model,
-            params={'params': state.params, 'batch_stats': state.batch_stats},
-            x=x
-        )
+        x = jax.device_put(x=x) / 255.
+        features = feature_step(state, x)
         break
 
     xb = jnp.empty(shape=(len(ds), features.shape[-1]))  # (N, D)
@@ -261,12 +258,8 @@ def get_features(state: train_state.TrainState, ds: tf.data.Dataset, batch_size:
         leave=False,
         position=1
     ):
-        x = jnp.array(object=x) / 255.
-        features, _ = feature_fn(
-            model=state.model,
-            params={'params': state.params, 'batch_stats': state.batch_stats},
-            x=x
-        )
+        x = jax.device_put(x=x) / 255.
+        features = feature_step(state, x)
 
         end_idx = start_idx + x.shape[0]
         xb = xb.at[start_idx:end_idx].set(features)
@@ -450,28 +443,15 @@ def get_p_y(
     return log_p_y, log_mult_prob
 
 
-def cross_entropy_loss(
-    params: flax.core.frozen_dict.FrozenDict,
-    batch_stats: flax.core.frozen_dict.FrozenDict,
-    model: nn.Module,
-    x: jax.Array,
-    y: jax.Array,
-    train: bool
-) -> tuple[jax.Array, jax.Array]:
-    """
-    """
-    logit, updates = model.apply(
-        variables={'params': params, 'batch_stats': batch_stats},
+@jax.jit
+def pred_step(state: train_state.TrainState, x: chex.Array) -> chex.Array:
+    logits, _ = state.apply_fn(
+        variables={'params': state.params, 'batch_stats': state.batch_stats},
         x=x,
-        train=train,
+        train=False,
         mutable=['batch_stats']
-    )  # return a tuple(loss, mutable vars)
-
-    loss = optax.softmax_cross_entropy(logits=logit, labels=y)
-
-    loss = jnp.mean(a=loss, axis=0)
-
-    return loss, updates
+    )
+    return logits
 
 
 def evaluate(state: train_state.TrainState, ds: tf.data.Dataset) -> chex.Array:
@@ -500,20 +480,38 @@ def evaluate(state: train_state.TrainState, ds: tf.data.Dataset) -> chex.Array:
         x = jax.dlpack.from_dlpack(x_dl)
         y = jax.dlpack.from_dlpack(y_dl)
 
-        logits, batch_stats = state.model.apply(variables={'params': state.params, 'batch_stats': state.batch_stats}, x=x, train=False, mutable=['batch_stats'])
+        logits = pred_step(state, x)
         accuracy = accuracy.merge(other=metrics.Accuracy.from_model_output(logits=logits, labels=y))
 
     return accuracy.compute()
 
 
+@jax.jit
+def train_step(state: train_state.TrainState, x: chex.Array, y: chex.Array) -> tuple[train_state.TrainState, chex.Array]:
+    """Train for a single step."""
+    def loss_fn(params: flax.core.frozen_dict.FrozenDict, batch_stats: flax.core.frozen_dict.FrozenDict) -> tuple[chex.Array, flax.core.frozen_dict.FrozenDict]:
+        logits, batch_stats_new = state.apply_fn(
+            variables={'params': params, 'batch_stats': batch_stats},
+            x=x,
+            train=True,
+            mutable=['batch_stats']
+        )
+        loss = optax.softmax_cross_entropy(logits=logits, labels=y).mean()
+
+        return loss, batch_stats_new
+
+    grad_value_fn = jax.value_and_grad(fun=loss_fn, argnums=0, has_aux=True)
+    (loss, batch_stats_new), grads = grad_value_fn(state.params, state.batch_stats)
+
+    state = state.apply_gradients(grads=grads)
+    state = state.replace(batch_stats=batch_stats_new['batch_stats'])
+
+    return state, loss
+
+
 def train_model(state: train_state.TrainState, dataset_train: tf.data.Dataset, p_y: chex.Array, num_epochs: int, aim_run: aim.Run, args: argparse.Namespace) -> train_state.TrainState:
     """
     """
-    # define loss function
-    loss_grad_fn = partial(cross_entropy_loss, model=state.model, train=True)
-    loss_grad_fn = jax.value_and_grad(fun=loss_grad_fn, argnums=0, has_aux=True)
-    loss_grad_fn = jax.jit(fun=loss_grad_fn)
-
     # generate another dataset for labels
     p_y_dataset = tf.data.Dataset.from_tensor_slices(tensors=p_y)
     assert len(p_y_dataset) == len(dataset_train), \
@@ -575,18 +573,19 @@ def train_model(state: train_state.TrainState, dataset_train: tf.data.Dataset, p
             keys = jax.random.split(key=args.key, num=x.shape[0])
             x = image_augmentation_fn(keys, x)
 
-            (loss, batch_stats_new), grads = loss_grad_fn(state.params, batch_stats=state.batch_stats, x=x, y=yhat)
-
-            state = state.apply_gradients(grads=grads)
-            state = state.replace(batch_stats=batch_stats_new['batch_stats'])
+            state, loss = train_step(state, x, yhat)
 
             loss_accumulate = metrics.Average.merge(self=loss_accumulate, other=metrics.Average.from_model_output(values=loss))
 
-        aim_run.track(value=loss_accumulate.compute(), name='Loss', context={'model': state.model_id})
+        aim_run.track(
+            value=loss_accumulate.compute(),
+            name='Loss',
+            context={'model': int(state.model_id)}
+        )
 
         # region EVALUATION
         acc = evaluate(state=state, ds=ds_test)
-        aim_run.track(value=acc, name='Accuracy', context={'model': state.model_id})
+        aim_run.track(value=acc, name='Accuracy', context={'model': int(state.model_id)})
         # endregion
 
     return state
@@ -596,8 +595,7 @@ class TrainState(train_state.TrainState):
     """A data-class storing model's parameters, optimizer and others
     """
     batch_stats: Any
-    model: nn.Module
-    model_id: int
+    model_id: chex.Numeric
 
 
 class AddNoiseState(NamedTuple):
