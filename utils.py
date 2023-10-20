@@ -38,21 +38,23 @@ from tqdm import tqdm
 from data_utils import image_folder_label_csv
 
 
-@jax.jit
-def batched_logmatmulexp_(logA: chex.Array, logB: chex.Array) -> chex.Array:
+@partial(jax.jit, static_argnums=(2, 3))
+def batched_logmatmulexp_(logA: chex.Array, logB: chex.Array, num_rows_A: int, num_cols_B: int) -> chex.Array:
     """Implement matrix multiplication in the log scale (see https://stackoverflow.com/a/74409968/5452342)
     Note: this implementation considers a batch of 2-d matrices.
 
     Args:
         logA: log of the first matrix (N, n, m)
         logB: log of the second matrix  # (N, m, k)
+        num_rows_A: the number of rows in matrix A (or n in this case)
+        num_cols_B: the number of columns in matrix B (or k in this case)
 
     Returns: log(AB)  # (n, k)
     """
-    logA_temp = jnp.tile(A=logA[:, None, :, :], reps=(1, logB.shape[-1], 1, 1))  # (N, k, n, m)
+    logA_temp = jnp.tile(A=jnp.expand_dims(a=logA, axis=1), reps=(1, num_cols_B, 1, 1))  # (N, k, n, m)
     logA_temp = jnp.transpose(a=logA_temp, axes=(0, 2, 1, 3))  # (N, n, k, m)
 
-    logB_temp = jnp.tile(A=logB[:, None, :, :], reps=(1, logA.shape[-2], 1, 1))  # (N, n, m, k)
+    logB_temp = jnp.tile(A=jnp.expand_dims(a=logB, axis=1), reps=(1, num_rows_A, 1, 1))  # (N, n, m, k)
     logB_temp = jnp.transpose(a=logB_temp, axes=(0, 1, 3, 2))  # (N, n, k, m)
 
     logAB = jax.scipy.special.logsumexp(a=logA_temp + logB_temp, axis=-1)  # (N, n, k)
@@ -69,9 +71,22 @@ def EM_for_mm(
     num_noisy_labels_per_sample: chex.Numeric,
     num_em_iter: chex.Numeric,
     alpha: chex.Numeric,
-    beta: chex.Numeric
+    beta: chex.Numeric,
+    key: jax.random.KeyArray
 ) -> tuple[chex.Array, chex.Array]:
     """
+    Args:
+        y: an array of data (N, num_multinomial_samples, C)
+        n_: the number of multinomial samples
+        d_: the number of classes/categories in the multinomial distributions
+        num_noisy_labels_per_sample: the total number of trials in each multinomial sample
+        num_em_iter:
+        alpha: the Dirichlet prior parameter for mixture coefficients
+        beta: the Dirichlet prior parameter for multinomial components
+
+    Returns:
+        log_mixture_coefficients:
+        log_mult_comps_probs:
     """
     # region initialize MIXTURE COEFFICIENTS and MULTINOMIAL COMPONENTS
     mixture_coefficients = jnp.array(object=[[1/d_] * d_] * batch_size_)  # (N, C)
@@ -80,7 +95,7 @@ def EM_for_mm(
 
     # add noise to multinomial probabilities
 
-    mult_comps_probs = 10 * mult_comps_probs + jax.random.uniform(key=jax.random.PRNGKey(6870), shape=(batch_size_, d_, d_))  # (N, C, C)
+    mult_comps_probs = 10 * mult_comps_probs + jax.random.uniform(key=key, shape=(batch_size_, d_, d_))  # (N, C, C)
     mult_comps_probs = mult_comps_probs / jnp.sum(a=mult_comps_probs, axis=-1, keepdims=True)  # (N, C, C)
     # endregion
 
@@ -97,13 +112,15 @@ def EM_for_mm(
     for _ in range(num_em_iter):
         multinomial_distributions = tfp.distributions.Multinomial(
             total_count=num_noisy_labels_per_sample,
-            logits=log_mult_comps_probs[:, :, None, :]
+            logits=jnp.expand_dims(a=log_mult_comps_probs, axis=-2)
         )
-        log_mult = multinomial_distributions.log_prob(value=y[:, None, :, :])  # (N, C, sample_shape)
+        log_mult = multinomial_distributions.log_prob(
+            value=jnp.expand_dims(a=y, axis=1)
+        )  # (N, C, sample_shape)
         log_mult = jnp.transpose(a=log_mult, axes=(0, 2, 1))  # (N, sample_shape, C)
 
         # E-step
-        log_gamma_num = log_mixture_coefficients[:, None, :] + log_mult  # (N, sample_shape, C)
+        log_gamma_num = jnp.expand_dims(a=log_mixture_coefficients, axis=1) + log_mult  # (N, sample_shape, C)
         log_gamma_den = jax.scipy.special.logsumexp(a=log_gamma_num, axis=-1, keepdims=True)  # (N, sample_shape, 1)
         log_gamma = log_gamma_num - log_gamma_den  # (N, sample_shape, C)
 
@@ -113,19 +130,23 @@ def EM_for_mm(
         log_mixture_coefficients_num = jnp.logaddexp(log_sum_gamma, log_alpha_m1)  # (N, C)
         log_mixture_coefficients = log_mixture_coefficients_num - log_mixture_coefficients_den
 
-        log_gamma_y = batched_logmatmulexp_(logA=jnp.transpose(a=log_gamma, axes=(0, 2, 1)), logB=jnp.log(y))  # (N, C, C)
+        log_gamma_y = batched_logmatmulexp_(
+            logA=jnp.transpose(a=log_gamma, axes=(0, 2, 1)),
+            logB=jnp.log(y),
+            num_rows_A=d_,
+            num_cols_B=d_
+        )  # (N, C, C)
         log_mult_comps_probs_num = jnp.logaddexp(log_gamma_y, log_beta_m1)  # (N, C, C)
 
         log_mult_comps_probs_den = jnp.log(num_noisy_labels_per_sample) + log_sum_gamma  # (N, C)
         log_mult_comps_probs_den = jnp.logaddexp(log_mult_comps_probs_den, jnp.log(d_) + log_beta_m1)  # (N, C)
-        # log_mult_comps_probs_den = log_mult_comps_probs_den + jnp.log1p(d_ * jnp.exp(-log_mult_comps_probs_den))
 
-        log_mult_comps_probs = log_mult_comps_probs_num - log_mult_comps_probs_den[:, :, None]
-        # mult_comps_probs = jnp.exp(log_mult_comps_probs)
+        log_mult_comps_probs = log_mult_comps_probs_num - jnp.expand_dims(a=log_mult_comps_probs_den, axis=-1)
 
     return log_mixture_coefficients, log_mult_comps_probs
 
 
+@partial(jax.jit, static_argnums=(2,))
 def augment_an_image(key: jax.random.PRNGKey, image: chex.Array, image_shape: tuple[int, int, int]) -> chex.Array:
     """perform data augmentation on a single image. For a batch of images,
     please apply jax.vmap
@@ -386,10 +407,62 @@ def get_batch_local_affine_coding(samples: np.ndarray, knn_indices: np.ndarray) 
     return x
 
 
+@partial(jax.jit, static_argnums=(3, 4, 5, 6, 7, 8, 9))
+def _get_p_y(
+    log_mixture_coefficients: chex.Array,
+    log_multinomial_probs: chex.Array,
+    key: jax.random.KeyArray,
+    num_noisy_labels_per_sample: int,
+    num_multinomial_samples: int,
+    num_classes: int,
+    batch_size_em: int,
+    num_em_iter: int,
+    alpha: float,
+    beta: float
+) -> tuple[chex.Array, chex.Array]:
+    mixture_distribution = tfp.distributions.Categorical(
+        logits=log_mixture_coefficients,
+        validate_args=True,
+        allow_nan_stats=False
+    )
+    component_distribution = tfp.distributions.Multinomial(
+        total_count=num_noisy_labels_per_sample,
+        logits=log_multinomial_probs,
+        validate_args=True
+    )
+
+    mult_mixture = tfp.distributions.MixtureSameFamily(
+        mixture_distribution=mixture_distribution,
+        components_distribution=component_distribution
+    )
+
+    # generate noisy labels
+    yhat = mult_mixture.sample(
+        sample_shape=(num_multinomial_samples,),
+        seed=key
+    )  # (sample_shape, N, C)
+    yhat = jnp.transpose(a=yhat, axes=(1, 0, 2))  # (N, sample_shape, C)
+
+    log_p_y, log_mult_prob = EM_for_mm(
+        y=yhat,
+        batch_size_=batch_size_em,
+        n_=num_multinomial_samples,
+        d_=num_classes,
+        num_noisy_labels_per_sample=num_noisy_labels_per_sample,
+        num_em_iter=num_em_iter,
+        alpha=alpha,
+        beta=beta,
+        key=key
+    )
+
+    return log_p_y, log_mult_prob
+
+
 def get_p_y(
-        log_mixture_coefficients: chex.Array,
-        log_multinomial_probs: chex.Array,
-        args: argparse.Namespace) -> tuple[chex.Array, chex.Array]:
+    log_mixture_coefficients: chex.Array,
+    log_multinomial_probs: chex.Array,
+    args: argparse.Namespace
+) -> tuple[chex.Array, chex.Array]:
     """Infer the noisy label distribution as a C-multinomial mixture model
         using EM. The data is generated from a (K + 1)C-multinomial mixture
         models obtained via nearest-neighbours
@@ -405,42 +478,18 @@ def get_p_y(
         log_mult_prob: a matrix containing the probability vectors of
             C-multinomial distributions
     """
-    mixture_distribution = tfp.distributions.Categorical(
-        logits=log_mixture_coefficients,
-        validate_args=True,
-        allow_nan_stats=False
-    )
-    component_distribution = tfp.distributions.Multinomial(
-        total_count=args.num_noisy_labels_per_sample,
-        logits=log_multinomial_probs,
-        validate_args=True
-    )
-
-    mult_mixture = tfp.distributions.MixtureSameFamily(
-        mixture_distribution=mixture_distribution,
-        components_distribution=component_distribution
-    )
-
-    # generate noisy labels
-    rng = np.random.default_rng(seed=None)
-    yhat = mult_mixture.sample(
-        sample_shape=(args.num_multinomial_samples,),
-        seed=jax.random.PRNGKey(seed=rng.integers(low=0, high=2**63))
-    )  # (sample_shape, N, C)
-    yhat = jnp.transpose(a=yhat, axes=(1, 0, 2))  # (N, sample_shape, C)
-
-    log_p_y, log_mult_prob = EM_for_mm(
-        y=yhat,
-        batch_size_=args.batch_size_em,
-        n_=args.num_multinomial_samples,
-        d_=args.num_classes,
+    return _get_p_y(
+        log_mixture_coefficients=log_mixture_coefficients,
+        log_multinomial_probs=log_multinomial_probs,
+        key=args.key,
         num_noisy_labels_per_sample=args.num_noisy_labels_per_sample,
+        num_multinomial_samples=args.num_multinomial_samples,
+        num_classes=args.num_classes,
+        batch_size_em=args.batch_size_em,
         num_em_iter=args.num_em_iter,
         alpha=args.alpha,
         beta=args.beta
     )
-
-    return log_p_y, log_mult_prob
 
 
 @jax.jit
