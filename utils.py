@@ -1,5 +1,6 @@
 import jax
 from jax import numpy as jnp
+import jax.dlpack
 from jax.experimental import sparse
 
 import flax
@@ -485,9 +486,19 @@ def evaluate(state: train_state.TrainState, ds: tf.data.Dataset) -> chex.Array:
     """
     accuracy = metrics.Accuracy(total=jnp.array(0.), count=jnp.array(0))
 
-    for image, label in tqdm(iterable=tfds.as_numpy(dataset=ds), desc=' validate', position=2, leave=False):
-        x = jnp.array(object=image) / 255.
-        y = jnp.array(label)
+    for x, y in tqdm(iterable=ds, desc=' validate', position=2, leave=False):
+        # move to GPU
+        with tf.device('/gpu:0'):
+            x = tf.identity(input=x)
+            y = tf.identity(input=y)
+
+        # move to DLPack
+        x_dl = tf.experimental.dlpack.to_dlpack(tf_tensor=x)
+        y_dl = tf.experimental.dlpack.to_dlpack(tf_tensor=y)
+
+        # convert to JAX
+        x = jax.dlpack.from_dlpack(x_dl)
+        y = jax.dlpack.from_dlpack(y_dl)
 
         logits, batch_stats = state.model.apply(variables={'params': state.params, 'batch_stats': state.batch_stats}, x=x, train=False, mutable=['batch_stats'])
         accuracy = accuracy.merge(other=metrics.Accuracy.from_model_output(logits=logits, labels=y))
@@ -507,39 +518,62 @@ def train_model(state: train_state.TrainState, dataset_train: tf.data.Dataset, p
     p_y_dataset = tf.data.Dataset.from_tensor_slices(tensors=p_y)
     assert len(p_y_dataset) == len(dataset_train), \
         f'Dataset lengths mismatch: len(p_y_dataset) = {len(p_y_dataset)}, while len(dataset_train) = {len(dataset_train)}'
-    dataset_noisy_labels = tf.data.Dataset.zip(dataset_train, p_y_dataset)
-    dataset_noisy_labels = dataset_noisy_labels.shuffle(buffer_size=args.total_num_samples, reshuffle_each_iteration=True)
-    dataset_noisy_labels = dataset_noisy_labels.batch(batch_size=args.batch_size)
-    dataset_noisy_labels = dataset_noisy_labels.prefetch(tf.data.AUTOTUNE)
 
-    # numpy random generator
-    rng = np.random.default_rng(seed=None)
+    ds_train = tf.data.Dataset.zip(dataset_train, p_y_dataset)
+    ds_train = ds_train.map(
+        map_func=lambda x, yhat: (tf.cast(x, tf.float32) / 255., yhat)
+    )
+    ds_train = ds_train.shuffle(buffer_size=args.total_num_samples, reshuffle_each_iteration=True)
+    ds_train = ds_train.batch(batch_size=args.batch_size)
+    ds_train = ds_train.prefetch(buffer_size=tf.data.AUTOTUNE)
+
+    # data augmentation
     image_augmentation_fn = jax.vmap(
         fun=partial(augment_an_image, image_shape=args.img_shape),
         in_axes=(0, 0)
     )
 
     # testing dataset
-    dataset_test, _ = image_folder_label_csv(
+    ds_test, _ = image_folder_label_csv(
         root_dir=os.path.join(args.dataset_root, 'test'),
         csv_path=os.path.join(args.dataset_root, 'split', 'clean_validation'),
         sample_indices=None,
         image_shape=args.img_shape
     )
-    dataset_test = dataset_test.batch(batch_size=args.batch_size)
+    ds_test = ds_test.batch(batch_size=args.batch_size)
+    ds_test = ds_test.map(
+        map_func=lambda x, y: (tf.cast(x, tf.float32) / 255., y)
+    )
+    ds_test = ds_test.prefetch(buffer_size=tf.data.AUTOTUNE)
 
     for _ in tqdm(iterable=range(num_epochs), desc='train', leave=False, position=1):
 
         # define metrics
         loss_accumulate = metrics.Average(total=jnp.array(0.), count=jnp.array(0))
 
-        for (x, y), yhat in tqdm(iterable=tfds.as_numpy(dataset=dataset_noisy_labels), desc=' epoch', leave=False, position=2):
-            x = jnp.array(object=x, dtype=jnp.float32) / 255.
-            yhat = jnp.array(object=yhat)
+        for x, yhat in tqdm(
+            iterable=ds_train,
+            desc=' epoch',
+            leave=False,
+            position=2
+        ):
+            # move to GPU
+            with tf.device('/gpu:0'):
+                x = tf.identity(input=x)
+                yhat = tf.identity(input=yhat)
+
+            # move to DLPack
+            x_dl = tf.experimental.dlpack.to_dlpack(tf_tensor=x)
+            yhat_dl = tf.experimental.dlpack.to_dlpack(tf_tensor=yhat)
+
+            # Load arrays from the DLPack
+            x = jax.dlpack.from_dlpack(x_dl)
+            yhat = jax.dlpack.from_dlpack(yhat_dl)
 
             # data augmentation
-            key = jax.vmap(fun=jax.random.PRNGKey)(rng.integers(low=0, high=2**63, size=y.size))
-            x = image_augmentation_fn(key, x)
+            args.key = jax.random.split(key=args.key, num=1).squeeze()
+            keys = jax.random.split(key=args.key, num=x.shape[0])
+            x = image_augmentation_fn(keys, x)
 
             (loss, batch_stats_new), grads = loss_grad_fn(state.params, batch_stats=state.batch_stats, x=x, y=yhat)
 
@@ -551,7 +585,7 @@ def train_model(state: train_state.TrainState, dataset_train: tf.data.Dataset, p
         aim_run.track(value=loss_accumulate.compute(), name='Loss', context={'model': state.model_id})
 
         # region EVALUATION
-        acc = evaluate(state=state, ds=dataset_test)
+        acc = evaluate(state=state, ds=ds_test)
         aim_run.track(value=acc, name='Accuracy', context={'model': state.model_id})
         # endregion
 

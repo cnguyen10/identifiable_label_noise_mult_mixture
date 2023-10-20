@@ -1,5 +1,6 @@
 import jax
 from jax import numpy as jnp
+import jax.dlpack
 
 from flax.training import train_state
 from flax.training import orbax_utils
@@ -114,7 +115,7 @@ def main() -> None:
     """
     # parse input arguments
     args = parse_arguments()
-    # print(xla_bridge.get_backend('cpu'))
+    args.key = jax.random.PRNGKey(seed=random.randint(a=0, b=1_000))
 
     # region JAX CONFIGURATION
     # set jax memory allocation
@@ -122,17 +123,17 @@ def main() -> None:
     os.environ["XLA_PYTHON_CLIENT_MEM_FRACTION"] = str(args.jax_mem_fraction)
 
     # configure CUDA for JAX
-    jax.config.update('jax_platforms', 'cuda')
+    # jax.config.update('jax_platforms', 'cuda')
 
-    # allocate TensorFlow GPU memory
-    tf.config.experimental.set_visible_devices([], 'GPU')  # disable GPU
+    # # allocate TensorFlow GPU memory
+    # tf.config.experimental.set_visible_devices([], 'GPU')  # disable GPU
 
-    # # limit GPU memory for TensorFlow
-    # gpus = tf.config.list_physical_devices('GPU')
-    # tf.config.set_logical_device_configuration(
-    #     device=gpus[0],
-    #     logical_devices=[tf.config.LogicalDeviceConfiguration(memory_limit=1024)]
-    # )
+    # limit GPU memory for TensorFlow
+    gpus = tf.config.list_physical_devices('GPU')
+    tf.config.set_logical_device_configuration(
+        device=gpus[0],
+        logical_devices=[tf.config.LogicalDeviceConfiguration(memory_limit=1024)]
+    )
     # endregion
 
     # region DATASET
@@ -148,6 +149,7 @@ def main() -> None:
             sample_indices=None,
             image_shape=args.img_shape
         )
+        dataset_train = dataset_train.map(map_func=lambda x, y: x)
 
         args.num_classes = len(set(labels))
         args.total_num_samples = len(dataset_train)
@@ -198,7 +200,8 @@ def main() -> None:
 
     args.lr_schedule_fn = optax.cosine_decay_schedule(
         init_value=args.lr,
-        decay_steps=10_000
+        decay_steps=20_000
+        # decay_steps=4 * int(args.total_num_samples / args.batch_size) * (args.num_warmup + args.num_epochs)
     )
 
     def initialize_train_state(model_id: int) -> train_state.TrainState:
@@ -206,7 +209,7 @@ def main() -> None:
             key=jax.random.PRNGKey(random.randint(a=0, b=1_000)),
             num=2
         )
-        x = jax.random.normal(key1, (1, 32, 32, 3))  # Dummy input data
+        x = jax.random.normal(key=key1, shape=(1,) + args.img_shape)  # Dummy input data
         params = model.init(rngs=key2, x=x, train=False)
 
         # add L2 regularisation(aka weight decay)
@@ -343,6 +346,26 @@ def main() -> None:
                 aim_run=aim_run,
                 args=args
             )
+
+        # save checkpoint
+        checkpoint = {
+            'state_1': {
+                'state': state_1,
+                'log_p_y': log_p_y_1,
+                'log_mult_prob': log_mult_prob_1
+            },
+            'state_2': {
+                'state': state_2,
+                'log_p_y': log_p_y_2,
+                'log_mult_prob': log_mult_prob_2
+            }
+        }
+        checkpoint_mngr.save(
+            step=0,
+            items=checkpoint,
+            save_kwargs={'save_args': orbax_utils.save_args_from_target(checkpoint)}
+        )
+        del checkpoint
         # endregion
 
     # define data-loaders to create sample indices
@@ -387,7 +410,7 @@ def main() -> None:
 
                     # find K nearest-neighbours
                     knn_indices_ = get_knn_indices(
-                        xb=np.array(features),
+                        xb=np.asarray(features),
                         num_nn=args.k
                     )
 
@@ -399,8 +422,8 @@ def main() -> None:
 
                     # run EM and re-label samples
                     return relabel_data(
-                        log_p_y=log_p_y_,
-                        log_mult_prob=log_mult_prob_,
+                        log_p_y=log_p_y_[sample_indices_],
+                        log_mult_prob=log_mult_prob_[sample_indices_],
                         nn_idx=knn_indices_,
                         coding_matrix=coding_matrix_,
                         args=args
@@ -410,7 +433,8 @@ def main() -> None:
                     log_p_y: chex.Array,
                     log_mult_prob: chex.Array,
                     state: dict,
-                    sample_indices: chex.Array
+                    sample_indices: chex.Array,
+                    mu: chex.Numeric = 0.
                 ) -> tuple[chex.Array, chex.Array]:
                     """
                     """
@@ -423,10 +447,10 @@ def main() -> None:
 
                     # update
                     log_p_y = log_p_y.at[sample_indices].set(
-                        values=log_p_y_temp
+                        values=mu * log_p_y[sample_indices] + (1 - mu) * log_p_y_temp
                     )
                     log_mult_prob = log_mult_prob.at[sample_indices].set(
-                        values=log_mult_prob_temp
+                        values=mu * log_mult_prob[sample_indices] + (1 - mu) * log_mult_prob_temp
                     )
 
                     return log_p_y, log_mult_prob
@@ -435,34 +459,36 @@ def main() -> None:
                     log_p_y=log_p_y_1,
                     log_mult_prob=log_mult_prob_1,
                     state=state_1,
-                    sample_indices=sample_indices_1
+                    sample_indices=sample_indices_1,
+                    mu=0.9
                 )
 
                 log_p_y_2, log_mult_prob_2 = update_mult_mixture(
                     log_p_y=log_p_y_2,
                     log_mult_prob=log_mult_prob_2,
                     state=state_2,
-                    sample_indices=sample_indices_2
+                    sample_indices=sample_indices_2,
+                    mu=0.9
                 )
 
-            # region TRAIN models on relabelled data
-            state_1 = train_model(
-                state=state_1,
-                dataset_train=dataset_train,
-                p_y=jnp.exp(log_p_y_2),
-                num_epochs=5,
-                aim_run=aim_run,
-                args=args
-            )
-            state_2 = train_model(
-                state=state_2,
-                dataset_train=dataset_train,
-                p_y=jnp.exp(log_p_y_1),
-                num_epochs=5,
-                aim_run=aim_run,
-                args=args
-            )
-            # endregion
+                # region TRAIN models on relabelled data
+                state_1 = train_model(
+                    state=state_1,
+                    dataset_train=dataset_train,
+                    p_y=jnp.exp(log_p_y_2),
+                    num_epochs=1,
+                    aim_run=aim_run,
+                    args=args
+                )
+                state_2 = train_model(
+                    state=state_2,
+                    dataset_train=dataset_train,
+                    p_y=jnp.exp(log_p_y_1),
+                    num_epochs=1,
+                    aim_run=aim_run,
+                    args=args
+                )
+                # endregion
 
             # save checkpoint
             checkpoint = {
