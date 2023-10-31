@@ -189,6 +189,7 @@ def parse_arguments() -> argparse.Namespace:
 
     parser.add_argument('--dataset-root', type=str, default=None, help='Path to the folder containing train and test sets')
     parser.add_argument('--logdir', type=str, default='logs', help='Folder to store logs')
+    parser.add_argument('--clean-validation-filename', type=str, default='clean_validation', help='The filename of the validation containing image paths and the corresponding labels')
 
     parser.add_argument('--img-shape', action='append', help='e.g., 32 32 3 or 224 224 3')
     parser.add_argument('--num-samples', type=int, default=None, help='Number of samples in each iteration. None is whole dataset')
@@ -220,6 +221,10 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument('--train', dest='train_flag', action='store_true')
     parser.add_argument('--test', dest='train_flag', action='store_false')
     parser.set_defaults(train_flag=True)
+
+    parser.add_argument('--ssl', dest='ssl', action='store_true')
+    parser.add_argument('--no-ssl', dest='ssl', action='store_false')
+    parser.set_defaults(ssl=False)
 
     parser.add_argument('--tqdm', dest='tqdm_flag', action='store_true')
     parser.add_argument('--no-tqdm', dest='tqdm_flag', action='store_false')
@@ -264,6 +269,7 @@ def get_features(state: train_state.TrainState, ds: tf.data.Dataset, batch_size:
     # get feature dimension
     for x, _ in tfds.as_numpy(dataset=ds):
         x = jax.device_put(x=x) / 255.
+        x = jnp.expand_dims(a=x, axis=0)
         features = feature_step(state, x)
         break
 
@@ -568,7 +574,7 @@ def train_model(state: train_state.TrainState, dataset_train: tf.data.Dataset, p
 
     ds_train = tf.data.Dataset.zip(dataset_train, p_y_dataset)
     ds_train = ds_train.map(
-        map_func=lambda x, yhat: (tf.cast(x, tf.float32) / 255., yhat)
+        map_func=lambda x, yhat: (tf.cast(tf.image.resize(x, args.img_shape[:-1]), tf.float32) / 255., yhat)
     )
     ds_train = ds_train.shuffle(buffer_size=args.total_num_samples, reshuffle_each_iteration=True)
     ds_train = ds_train.batch(batch_size=args.batch_size)
@@ -583,13 +589,13 @@ def train_model(state: train_state.TrainState, dataset_train: tf.data.Dataset, p
     # testing dataset
     ds_test, _ = image_folder_label_csv(
         root_dir=os.path.join(args.dataset_root, 'test'),
-        csv_path=os.path.join(args.dataset_root, 'split', 'clean_validation'),
+        csv_path=os.path.join(args.dataset_root, 'split', args.clean_validation_filename),
         sample_indices=None,
         image_shape=args.img_shape
     )
     ds_test = ds_test.batch(batch_size=args.batch_size)
     ds_test = ds_test.map(
-        map_func=lambda x, y: (tf.cast(x, tf.float32) / 255., y)
+        map_func=lambda x, y: (tf.cast(tf.image.resize(x, args.img_shape[:-1]), tf.float32) / 255., y)
     )
     ds_test = ds_test.prefetch(buffer_size=tf.data.AUTOTUNE)
 
