@@ -22,7 +22,7 @@ class BasicBlock(nn.Module):
         else:
             shortcut = x
 
-        out = nn.Conv(features=self.planes, kernel_size=(3, 3), strides=self.stride, padding=1, use_bias=False)(inputs=x)
+        out = nn.Conv(features=self.planes, kernel_size=(3, 3), strides=self.stride, padding=1, use_bias=False)(inputs=out)
         out = nn.BatchNorm(use_running_average=not train)(x=out)
         out = nn.relu(x=out)
 
@@ -51,7 +51,7 @@ class PreActBlock(nn.Module):
         out = nn.BatchNorm(use_running_average=not train)(x=x)
         out = nn.relu(x=out)
 
-        out = nn.Conv(features=self.planes, kernel_size=(3, 3), strides=self.stride, padding=1, use_bias=False)(inputs=x)
+        out = nn.Conv(features=self.planes, kernel_size=(3, 3), strides=self.stride, padding=1, use_bias=False)(inputs=out)
         out = nn.BatchNorm(use_running_average=not train)(x=out)
         out = nn.relu(x=out)
 
