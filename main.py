@@ -745,7 +745,7 @@ def main(cfg: DictConfig) -> None:
                     iterable=range(cfg.training.num_epochs_warmup),
                     desc='Warmup',
                     ncols=80,
-                    leave=False,
+                    leave=True,
                     position=0,
                     colour='green',
                     disable=not cfg.data_loading.progress_bar
@@ -809,7 +809,7 @@ def main(cfg: DictConfig) -> None:
 
             for sample_indices_1, sample_indices_2 in tqdm(
                 iterable=zip(idx_loader1, idx_loader2),
-                total=cfg.dataset.length.train // cfg.hparams.num_samples_search_knn + 1,
+                total=int(jnp.ceil(cfg.dataset.length.train / cfg.hparams.num_samples_search_knn)),
                 desc='Neighboring',
                 ncols=80,
                 leave=False,
@@ -837,55 +837,55 @@ def main(cfg: DictConfig) -> None:
                 coding_matrix_2 = coding_matrix_2.at[sample_indices_2].set(values=coding_matrix_2_temp)
                 # endregion
 
-                # region RE-LABEL
-                log_p_y_nn_1, log_mult_prob_nn_1 = relabel_data(
-                    log_p_y=log_p_y_1,
-                    log_mult_prob=log_mult_prob_1,
-                    nn_idx=nn_matrix_1,
-                    coding_matrix=coding_matrix_1,
-                    cfg=cfg
-                )
+            # region RE-LABEL
+            log_p_y_nn_1, log_mult_prob_nn_1 = relabel_data(
+                log_p_y=log_p_y_1,
+                log_mult_prob=log_mult_prob_1,
+                nn_idx=nn_matrix_1,
+                coding_matrix=coding_matrix_1,
+                cfg=cfg
+            )
 
-                log_p_y_nn_2, log_mult_prob_nn_2 = relabel_data(
-                    log_p_y=log_p_y_2,
-                    log_mult_prob=log_mult_prob_2,
-                    nn_idx=nn_matrix_2,
-                    coding_matrix=coding_matrix_2,
-                    cfg=cfg
-                )
-                # endregion
+            log_p_y_nn_2, log_mult_prob_nn_2 = relabel_data(
+                log_p_y=log_p_y_2,
+                log_mult_prob=log_mult_prob_2,
+                nn_idx=nn_matrix_2,
+                coding_matrix=coding_matrix_2,
+                cfg=cfg
+            )
+            # endregion
 
-                log_p_y_1, log_mult_prob_1 = update_mult_mixture(
-                    log_p_y=log_p_y_1,
-                    log_mult_prob=log_mult_prob_1,
-                    log_p_y_nn=log_p_y_nn_1,
-                    log_mult_prob_nn=log_mult_prob_nn_1,
-                    mu=cfg.hparams.mu
-                )
+            log_p_y_1, log_mult_prob_1 = update_mult_mixture(
+                log_p_y=log_p_y_1,
+                log_mult_prob=log_mult_prob_1,
+                log_p_y_nn=log_p_y_nn_1,
+                log_mult_prob_nn=log_mult_prob_nn_1,
+                mu=cfg.hparams.mu
+            )
 
-                log_p_y_2, log_mult_prob_2 = update_mult_mixture(
-                    log_p_y=log_p_y_2,
-                    log_mult_prob=log_mult_prob_2,
-                    log_p_y_nn=log_p_y_nn_2,
-                    log_mult_prob_nn=log_mult_prob_nn_2,
-                    mu=cfg.hparams.mu
-                )
+            log_p_y_2, log_mult_prob_2 = update_mult_mixture(
+                log_p_y=log_p_y_2,
+                log_mult_prob=log_mult_prob_2,
+                log_p_y_nn=log_p_y_nn_2,
+                log_mult_prob_nn=log_mult_prob_nn_2,
+                mu=cfg.hparams.mu
+            )
 
-                # region TRAIN models on relabelled data
-                state_1, loss_1 = train_cross_entropy(
-                    optimizer=state_1,
-                    dataloader=iter_dataloader_train_1,
-                    p_y=jnp.exp(log_p_y_2),
-                    cfg=cfg
-                )
+            # region TRAIN models on relabelled data
+            state_1, loss_1 = train_cross_entropy(
+                optimizer=state_1,
+                dataloader=iter_dataloader_train_1,
+                p_y=jnp.exp(log_p_y_2),
+                cfg=cfg
+            )
 
-                state_2, loss_2 = train_cross_entropy(
-                    optimizer=state_2,
-                    dataloader=iter_dataloader_train_2,
-                    p_y=jnp.exp(log_p_y_1),
-                    cfg=cfg
-                )
-                # endregion
+            state_2, loss_2 = train_cross_entropy(
+                optimizer=state_2,
+                dataloader=iter_dataloader_train_2,
+                p_y=jnp.exp(log_p_y_1),
+                cfg=cfg
+            )
+            # endregion
 
             # save checkpoint
             ckpt_mngr.save(
