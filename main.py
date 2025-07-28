@@ -25,6 +25,7 @@ from pathlib import Path
 
 from tqdm import tqdm
 import logging
+from typing import Callable
 
 import hydra
 from omegaconf import DictConfig, OmegaConf
@@ -35,6 +36,44 @@ from utils import get_knn_indices, get_batch_local_affine_coding, EM_for_mm
 
 from utils import init_tx, initialize_dataloader
 from mixup import mixup_data
+
+
+class PretrainedModel(nnx.Module):
+    def __init__(
+        self,
+        model_fn: Callable,
+        feature_dim: int,
+        num_classes: int,
+        rngs: nnx.Rngs,
+        dropout_rate: float,
+        dtype: jnp.dtype = jnp.float32
+    ) -> None:
+        super().__init__()
+
+        self.feature_extractor = model_fn(
+            num_classes=feature_dim,
+            rngs=rngs,
+            dropout_rate=dropout_rate,
+            dtype=dtype
+        )
+
+        self.clf = nnx.Linear(
+            in_features=feature_dim,
+            out_features=num_classes,
+            dtype=dtype,
+            rngs=rngs
+        )
+
+    def get_features(self, x: jax.Array) -> jax.Array:
+        """
+        """
+        return self.feature_extractor(x)
+
+    def __call__(self, x: jnp.ndarray) -> jnp.ndarray:
+        out = self.get_features(x=x)
+        out = self.clf(out)
+
+        return out
 
 
 def extract_features(
@@ -424,71 +463,6 @@ def get_nn_coding_matrix(
     return knn_indices, coding_matrix
 
 
-# def relabel_data_wrapper(
-#     state_: nnx.Optimizer,
-#     sample_indices_: jax.Array,
-#     log_p_y_: jax.Array,
-#     log_mult_prob_: jax.Array,
-#     cfg: DictConfig
-# ) -> tuple[jax.Array, jax.Array]:
-#     """This is a wrapper to execute the following actions:
-#     - extract features
-#     - find nearest neighbours
-#     - solve for similarity coding coefficients
-#     - re-label data
-#     """
-#     sub_datasource = ImageDataSource(
-#         annotation_file=cfg.dataset.train_file,
-#         root=cfg.dataset.root,
-#         idx_list=sample_indices_
-#     )
-
-#     sub_dataloader = initialize_dataloader(
-#         data_source=sub_datasource,
-#         num_epochs=1,
-#         seed=random.randint(a=0, b=1_000),
-#         shuffle=True,
-#         batch_size=cfg.training.batch_size,
-#         resize=cfg.data_augmentation.resize,
-#         padding_px=cfg.data_augmentation.padding_px,
-#         crop_size=cfg.data_augmentation.crop_size,
-#         mean=cfg.data_augmentation.mean,
-#         std=cfg.data_augmentation.std,
-#         p_flip=cfg.data_augmentation.prob_random_flip,
-#         num_workers=cfg.data_loading.num_workers,
-#         num_threads=cfg.data_loading.num_threads,
-#         prefetch_size=cfg.data_loading.prefetch_size
-#     )
-
-#     # extract features
-#     features = extract_features(
-#         model=state_.model,
-#         dataloader=sub_dataloader,
-#         cfg=cfg
-#     )
-
-#     # find K nearest-neighbours
-#     knn_indices_ = get_knn_indices(
-#         xb=np.asarray(features),
-#         num_nn=cfg.hparams.num_nearest_neighbrs
-#     )
-
-#     # calculate coding mtrices
-#     coding_matrix_ = get_batch_local_affine_coding(
-#         samples=jnp.astype(features, jnp.float32),
-#         knn_indices=knn_indices_
-#     )
-
-#     # run EM and re-label samples
-#     return relabel_data(
-#         log_p_y=log_p_y_[sample_indices_],
-#         log_mult_prob=log_mult_prob_[sample_indices_],
-#         nn_idx=knn_indices_,
-#         coding_matrix=coding_matrix_,
-#         cfg=cfg
-#     )
-
-
 def update_mult_mixture(
     log_p_y: jax.Array,
     log_mult_prob: jax.Array,
@@ -567,11 +541,19 @@ def main(cfg: DictConfig) -> None:
     # endregion
 
     # region MODELS
-    model = hydra.utils.instantiate(config=cfg.model)(
+    # model = hydra.utils.instantiate(config=cfg.model)(
+    #     num_classes=cfg.dataset.num_classes,
+    #     rngs=nnx.Rngs(jax.random.PRNGKey(seed=random.randint(a=0, b=100))),
+    #     dropout_rate=cfg.training.dropout_rate,
+    #     dtype=eval(cfg.jax.dtype)
+    # )
+    model = PretrainedModel(
+        model_fn=hydra.utils.instantiate(config=cfg.model),
+        feature_dim=cfg.pretrained.feature_dim,
         num_classes=cfg.dataset.num_classes,
-        rngs=nnx.Rngs(jax.random.PRNGKey(seed=random.randint(a=0, b=100))),
         dropout_rate=cfg.training.dropout_rate,
-        dtype=eval(cfg.jax.dtype)
+        dtype=eval(cfg.jax.dtype),
+        rngs=nnx.Rngs(jax.random.PRNGKey(seed=random.randint(a=0, b=100)))
     )
 
     state_1 = nnx.Optimizer(
@@ -603,11 +585,30 @@ def main(cfg: DictConfig) -> None:
 
     del model
 
+    # load pretrained model
+    with ocp.CheckpointManager(
+        directory=cfg.pretrained.path,
+        options=ocp.CheckpointManagerOptions(
+            save_interval_steps=100,
+            max_to_keep=1,
+            step_format_fixed_length=3,
+            enable_async_checkpointing=True
+        )
+    ) as ckpt_mngr:
+        checkpoint = ckpt_mngr.restore(
+            step=500,
+            args=ocp.args.StandardRestore(item=nnx.state(state_1.model.feature_extractor))
+        )
+
+        nnx.update(state_1.model.feature_extractor, checkpoint)
+        nnx.update(state_2.model.feature_extractor, checkpoint)
+        del checkpoint
+
     ckpt_options = ocp.CheckpointManagerOptions(
         save_interval_steps=100,
-        max_to_keep=1,
+        max_to_keep=3,
         step_format_fixed_length=3,
-        enable_async_checkpointing=True
+        enable_async_checkpointing=False
     )
     # endregion
 
@@ -779,7 +780,7 @@ def main(cfg: DictConfig) -> None:
             desc='progress',
             ncols=80,
             leave=True,
-            position=1,
+            position=0,
             colour='green',
             disable=not cfg.data_loading.progress_bar
         ):

@@ -24,13 +24,17 @@ training:
   lr: 0.01
   batch_size: 128
   num_epochs: 300
-  num_epochs_warmup: 30
+  num_epochs_warmup: 10
   clipped_norm: 10
+
+pretrained:
+  path: /sda2/cuong/simclr_nnx/logdir/simCLR/b9cb5868fe734380bc6d485e9c8f8104/
+  feature_dim: 128
 
 hparams:
   num_samples_search_knn: 10000
   num_nearest_neighbrs: 100
-  mu: 0.9
+  mu: 0.5
   batch_size_em: 100
   num_em_iter: 10
   num_multinomial_samples: 19
