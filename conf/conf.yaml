@@ -1,0 +1,40 @@
+defaults:
+  - cifar10n
+  - override hydra/hydra_logging: disabled  
+  - override hydra/job_logging: disabled
+  - _self_
+  
+hydra:  
+  output_subdir: null  
+  run:  
+    dir: .
+
+experiment:
+  name: Identifiability
+  tracking_uri: sqlite:///identifiability.db
+  logdir: ./logdir
+  run_id: null
+
+data_loading:
+  num_workers: 8
+  num_threads: 4
+  prefetch_size: 2
+  progress_bar: True
+
+training:
+  momentum: 0.9
+  weight_decay: 0.0005
+  dropout_rate: 0.
+  eval_every_n_epochs: 10
+
+mixup:
+  enable: True
+  beta:
+    a: 0.1
+    b: 0.1
+
+jax:
+  platform: cuda
+  mem: 0.5  # percentage of VRAM in GPU will be allocated
+  disable_jit: False
+  dtype: jnp.bfloat16

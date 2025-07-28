@@ -1,0 +1,38 @@
+dataset:
+  name: cifar10n
+  root: /sda2/datasets/cifar10n
+  num_classes: 10
+  num_noisy_labels_per_sample: 3
+  train_file: ${dataset.root}/train_noisy.json
+  test_file: ${dataset.root}/test.json
+
+data_augmentation:
+  resize: null
+  padding_px: 4
+  crop_size: [32, 32]
+  prob_random_flip: 0.5
+  mean: null
+  std: null
+
+model:
+  _partial_: True
+  _target_: models.ResNet.PreActResNet18
+  in_channels: 3  # color images: 3, black and white: 1
+  conv1_kernel_size: [3, 3]
+
+training:
+  lr: 0.01
+  batch_size: 128
+  num_epochs: 300
+  num_epochs_warmup: 30
+  clipped_norm: 10
+
+hparams:
+  num_samples_search_knn: 10000
+  num_nearest_neighbrs: 100
+  mu: 0.9
+  batch_size_em: 100
+  num_em_iter: 10
+  num_multinomial_samples: 19
+  alpha: 1.1  # Dirichlet prior for categorical distribution Pr(y | x)
+  beta: 1.1  # Dirichlet prior for multinomial distribution
