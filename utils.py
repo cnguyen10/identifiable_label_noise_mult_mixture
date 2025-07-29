@@ -296,7 +296,8 @@ def init_tx(
     num_iters_per_epoch = dataset_length // batch_size
     lr_schedule_fn = optax.cosine_decay_schedule(
         init_value=lr,
-        decay_steps=(num_epochs + 10) * num_iters_per_epoch
+        decay_steps=num_epochs * num_iters_per_epoch,
+        alpha=0.001
     )
 
     # define an optimizer
