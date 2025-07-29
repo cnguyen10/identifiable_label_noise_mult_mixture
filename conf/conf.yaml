@@ -24,7 +24,7 @@ data_loading:
 training:
   momentum: 0.9
   weight_decay: 0.0005
-  dropout_rate: 0.
+  dropout_rate: 0.1
   eval_every_n_epochs: 10
 
 mixup:

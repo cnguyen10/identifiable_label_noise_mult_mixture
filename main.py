@@ -214,7 +214,7 @@ def evaluate(
     for samples in tqdm(
         iterable=dataloader,
         total=cfg.dataset.length.test // cfg.training.batch_size + 1,
-        desc='train',
+        desc='eval',
         ncols=80,
         leave=False,
         position=1,
@@ -316,7 +316,7 @@ def get_p_y(
         log_mixture_coefficients=log_mixture_coefficients,
         log_multinomial_probs=log_multinomial_probs,
         key=jax.random.key(seed=random.randint(a=0, b=100_000)),
-        num_noisy_labels_per_sample=cfg.dataset.num_noisy_labels_per_sample,
+        num_noisy_labels_per_sample=cfg.hparams.num_noisy_labels_per_sample,
         num_multinomial_samples=cfg.hparams.num_multinomial_samples,
         num_classes=cfg.dataset.num_classes,
         batch_size_em=cfg.hparams.batch_size_em,
@@ -451,7 +451,8 @@ def get_nn_coding_matrix(
     # find K nearest-neighbours
     knn_indices = get_knn_indices(
         xb=np.asarray(features),
-        num_nn=cfg.hparams.num_nearest_neighbrs
+        num_nn=cfg.hparams.num_nearest_neighbrs,
+        ids=sample_indices
     )
 
     # calculate coding mtrices
@@ -599,9 +600,8 @@ def main(cfg: DictConfig) -> None:
             step=500,
             args=ocp.args.StandardRestore(item=nnx.state(state_1.model.feature_extractor))
         )
-
         nnx.update(state_1.model.feature_extractor, checkpoint)
-        nnx.update(state_2.model.feature_extractor, checkpoint)
+        # nnx.update(state_2.model.feature_extractor, checkpoint)
         del checkpoint
 
     ckpt_options = ocp.CheckpointManagerOptions(
@@ -784,92 +784,93 @@ def main(cfg: DictConfig) -> None:
             colour='green',
             disable=not cfg.data_loading.progress_bar
         ):
-            idx_loader1 = (
-                grain.MapDataset.range(start=0, stop=cfg.dataset.length.train, step=1)
-                    .shuffle(seed=random.randint(a=0, b=100_000))  # Shuffles globally.
-                    .map(lambda x: x)  # Maps each element.
-                    .batch(batch_size=cfg.hparams.num_samples_search_knn)  # Batches consecutive elements.
-            )
-            idx_loader2 = (
-                grain.MapDataset.range(start=0, stop=cfg.dataset.length.train, step=1)
-                    .shuffle(seed=random.randint(a=0, b=100_000))  # Shuffles globally.
-                    .map(lambda x: x)  # Maps each element.
-                    .batch(batch_size=cfg.hparams.num_samples_search_knn)  # Batches consecutive elements.
-            )
+            if (epoch_id + 1) % cfg.hparams.relabeling_every_n_epochs == 0:
+                idx_loader1 = (
+                    grain.MapDataset.range(start=0, stop=cfg.dataset.length.train, step=1)
+                        .shuffle(seed=random.randint(a=0, b=100_000))  # Shuffles globally.
+                        .map(lambda x: x)  # Maps each element.
+                        .batch(batch_size=cfg.hparams.num_samples_search_knn)  # Batches consecutive elements.
+                )
+                idx_loader2 = (
+                    grain.MapDataset.range(start=0, stop=cfg.dataset.length.train, step=1)
+                        .shuffle(seed=random.randint(a=0, b=100_000))  # Shuffles globally.
+                        .map(lambda x: x)  # Maps each element.
+                        .batch(batch_size=cfg.hparams.num_samples_search_knn)  # Batches consecutive elements.
+                )
 
-            # initialize nearest neighbor matrix and coding matrix
-            nn_matrix_1 = jnp.zeros(
-                shape=(cfg.dataset.length.train, cfg.hparams.num_nearest_neighbrs),
-                dtype=jnp.int32
-            )  # (N, K)
-            coding_matrix_1 = jnp.zeros_like(a=nn_matrix_1, dtype=jnp.float32)  # (N, K)
+                # initialize nearest neighbor matrix and coding matrix
+                nn_matrix_1 = jnp.zeros(
+                    shape=(cfg.dataset.length.train, cfg.hparams.num_nearest_neighbrs),
+                    dtype=jnp.int32
+                )  # (N, K)
+                coding_matrix_1 = jnp.zeros_like(a=nn_matrix_1, dtype=jnp.float32)  # (N, K)
 
-            nn_matrix_2 = jnp.zeros_like(a=nn_matrix_1, dtype=jnp.int32)
-            coding_matrix_2 = jnp.zeros_like(a=nn_matrix_1, dtype=jnp.float32)
+                nn_matrix_2 = jnp.zeros_like(a=nn_matrix_1, dtype=jnp.int32)
+                coding_matrix_2 = jnp.zeros_like(a=nn_matrix_1, dtype=jnp.float32)
 
-            for sample_indices_1, sample_indices_2 in tqdm(
-                iterable=zip(idx_loader1, idx_loader2),
-                total=int(jnp.ceil(cfg.dataset.length.train / cfg.hparams.num_samples_search_knn)),
-                desc='Neighboring',
-                ncols=80,
-                leave=False,
-                position=1,
-                colour='green',
-                disable=not cfg.data_loading.progress_bar
-            ):
-                # region FIND K-NN and CODING MATRIX
-                nn_matrix_1_temp, coding_matrix_1_temp = get_nn_coding_matrix(
-                    model=state_1.model,
-                    sample_indices=sample_indices_1,
+                for sample_indices_1, sample_indices_2 in tqdm(
+                    iterable=zip(idx_loader1, idx_loader2),
+                    total=int(jnp.ceil(cfg.dataset.length.train / cfg.hparams.num_samples_search_knn)),
+                    desc='Neighboring',
+                    ncols=80,
+                    leave=False,
+                    position=1,
+                    colour='green',
+                    disable=not cfg.data_loading.progress_bar
+                ):
+                    # region FIND K-NN and CODING MATRIX
+                    nn_matrix_1_temp, coding_matrix_1_temp = get_nn_coding_matrix(
+                        model=state_1.model,
+                        sample_indices=sample_indices_1,
+                        cfg=cfg
+                    )
+
+                    nn_matrix_1 = nn_matrix_1.at[sample_indices_1].set(values=nn_matrix_1_temp.astype(jnp.int32))
+                    coding_matrix_1 = coding_matrix_1.at[sample_indices_1].set(values=coding_matrix_1_temp)
+
+                    nn_matrix_2_temp, coding_matrix_2_temp = get_nn_coding_matrix(
+                        model=state_2.model,
+                        sample_indices=sample_indices_2,
+                        cfg=cfg
+                    )
+
+                    nn_matrix_2 = nn_matrix_2.at[sample_indices_2].set(values=nn_matrix_2_temp.astype(jnp.int32))
+                    coding_matrix_2 = coding_matrix_2.at[sample_indices_2].set(values=coding_matrix_2_temp)
+                    # endregion
+
+                # region RE-LABEL
+                log_p_y_nn_1, log_mult_prob_nn_1 = relabel_data(
+                    log_p_y=log_p_y_1,
+                    log_mult_prob=log_mult_prob_1,
+                    nn_idx=nn_matrix_1,
+                    coding_matrix=coding_matrix_1,
                     cfg=cfg
                 )
 
-                nn_matrix_1 = nn_matrix_1.at[sample_indices_1].set(values=nn_matrix_1_temp.astype(jnp.int32))
-                coding_matrix_1 = coding_matrix_1.at[sample_indices_1].set(values=coding_matrix_1_temp)
-
-                nn_matrix_2_temp, coding_matrix_2_temp = get_nn_coding_matrix(
-                    model=state_2.model,
-                    sample_indices=sample_indices_2,
+                log_p_y_nn_2, log_mult_prob_nn_2 = relabel_data(
+                    log_p_y=log_p_y_2,
+                    log_mult_prob=log_mult_prob_2,
+                    nn_idx=nn_matrix_2,
+                    coding_matrix=coding_matrix_2,
                     cfg=cfg
                 )
-
-                nn_matrix_2 = nn_matrix_2.at[sample_indices_2].set(values=nn_matrix_2_temp.astype(jnp.int32))
-                coding_matrix_2 = coding_matrix_2.at[sample_indices_2].set(values=coding_matrix_2_temp)
                 # endregion
 
-            # region RE-LABEL
-            log_p_y_nn_1, log_mult_prob_nn_1 = relabel_data(
-                log_p_y=log_p_y_1,
-                log_mult_prob=log_mult_prob_1,
-                nn_idx=nn_matrix_1,
-                coding_matrix=coding_matrix_1,
-                cfg=cfg
-            )
+                log_p_y_1, log_mult_prob_1 = update_mult_mixture(
+                    log_p_y=log_p_y_1,
+                    log_mult_prob=log_mult_prob_1,
+                    log_p_y_nn=log_p_y_nn_1,
+                    log_mult_prob_nn=log_mult_prob_nn_1,
+                    mu=cfg.hparams.mu
+                )
 
-            log_p_y_nn_2, log_mult_prob_nn_2 = relabel_data(
-                log_p_y=log_p_y_2,
-                log_mult_prob=log_mult_prob_2,
-                nn_idx=nn_matrix_2,
-                coding_matrix=coding_matrix_2,
-                cfg=cfg
-            )
-            # endregion
-
-            log_p_y_1, log_mult_prob_1 = update_mult_mixture(
-                log_p_y=log_p_y_1,
-                log_mult_prob=log_mult_prob_1,
-                log_p_y_nn=log_p_y_nn_1,
-                log_mult_prob_nn=log_mult_prob_nn_1,
-                mu=cfg.hparams.mu
-            )
-
-            log_p_y_2, log_mult_prob_2 = update_mult_mixture(
-                log_p_y=log_p_y_2,
-                log_mult_prob=log_mult_prob_2,
-                log_p_y_nn=log_p_y_nn_2,
-                log_mult_prob_nn=log_mult_prob_nn_2,
-                mu=cfg.hparams.mu
-            )
+                log_p_y_2, log_mult_prob_2 = update_mult_mixture(
+                    log_p_y=log_p_y_2,
+                    log_mult_prob=log_mult_prob_2,
+                    log_p_y_nn=log_p_y_nn_2,
+                    log_mult_prob_nn=log_mult_prob_nn_2,
+                    mu=cfg.hparams.mu
+                )
 
             # region TRAIN models on relabelled data
             state_1, loss_1 = train_cross_entropy(
@@ -918,6 +919,8 @@ def main(cfg: DictConfig) -> None:
 
             mlflow.log_metrics(
                 metrics={
+                    'loss/model_1': loss_1,
+                    'loss/model_2': loss_2,
                     'accuracy/model_1': acc_1,
                     'accuracy/model_2': acc_2,
                     'accuracy/average': 0.5 * (acc_1 + acc_2)

@@ -2,7 +2,6 @@ dataset:
   name: cifar10n
   root: /sda2/datasets/cifar10n
   num_classes: 10
-  num_noisy_labels_per_sample: 3
   train_file: ${dataset.root}/train_noisy.json
   test_file: ${dataset.root}/test.json
 
@@ -24,7 +23,7 @@ training:
   lr: 0.01
   batch_size: 128
   num_epochs: 300
-  num_epochs_warmup: 10
+  num_epochs_warmup: 20
   clipped_norm: 10
 
 pretrained:
@@ -35,8 +34,10 @@ hparams:
   num_samples_search_knn: 10000
   num_nearest_neighbrs: 100
   mu: 0.5
+  relabeling_every_n_epochs: 10
   batch_size_em: 100
   num_em_iter: 10
-  num_multinomial_samples: 19
+  num_multinomial_samples: 100
+  num_noisy_labels_per_sample: 19
   alpha: 1.1  # Dirichlet prior for categorical distribution Pr(y | x)
   beta: 1.1  # Dirichlet prior for multinomial distribution
