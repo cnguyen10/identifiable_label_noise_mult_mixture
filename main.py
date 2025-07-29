@@ -520,25 +520,22 @@ def main(cfg: DictConfig) -> None:
     # endregion
 
     # region INITIAL NOISY LABEL DISTRIBUTION
-    p_y_1 = get_soft_noisy_labels(
+    p_y = get_soft_noisy_labels(
         datasource=source_train,
         num_classes=cfg.dataset.num_classes,
         progress_bar_flag=cfg.data_loading.progress_bar
     )
-    p_y_1 = optax.smooth_labels(labels=p_y_1, alpha=0.1)
-    log_p_y_1 = jnp.log(p_y_1)
+    p_y = optax.smooth_labels(labels=p_y, alpha=0.1)
+    log_p_y = jnp.log(p_y)
 
-    del p_y_1
+    del p_y
 
-    log_mult_prob_1 = jnp.eye(N=cfg.dataset.num_classes)  # (C, C)
-    log_mult_prob_1 = jnp.tile(A=log_mult_prob_1[None, :, :], reps=(cfg.dataset.length.train, 1, 1))  # (N, C, C)
+    log_mult_prob = jnp.eye(N=cfg.dataset.num_classes)  # (C, C)
+    log_mult_prob = jnp.tile(A=log_mult_prob[None, :, :], reps=(cfg.dataset.length.train, 1, 1))  # (N, C, C)
 
     # add random noise
-    log_mult_prob_1 = 10 * log_mult_prob_1 + np.random.rand(*log_mult_prob_1.shape)
-    log_mult_prob_1 = jax.nn.log_softmax(x=log_mult_prob_1, axis=-1)
-
-    log_p_y_2 = log_p_y_1 + 0.
-    log_mult_prob_2 = log_mult_prob_1 + 0.
+    log_mult_prob = 10 * log_mult_prob + np.random.rand(*log_mult_prob.shape)
+    log_mult_prob = jax.nn.log_softmax(x=log_mult_prob, axis=-1)
     # endregion
 
     # region MODELS
@@ -557,7 +554,7 @@ def main(cfg: DictConfig) -> None:
         rngs=nnx.Rngs(jax.random.PRNGKey(seed=random.randint(a=0, b=100)))
     )
 
-    state_1 = nnx.Optimizer(
+    state = nnx.Optimizer(
         model=model,
         tx=init_tx(
             dataset_length=len(source_train),
@@ -570,20 +567,6 @@ def main(cfg: DictConfig) -> None:
             key=random.randint(a=0, b=100)
         )
     )
-    state_2 = nnx.Optimizer(
-        model=model,
-        tx=init_tx(
-            dataset_length=len(source_train),
-            lr=cfg.training.lr,
-            batch_size=cfg.training.batch_size,
-            num_epochs=cfg.training.num_epochs,
-            weight_decay=cfg.training.weight_decay,
-            momentum=cfg.training.momentum,
-            clipped_norm=cfg.training.clipped_norm,
-            key=random.randint(a=0, b=100)
-        )
-    )
-
     del model
 
     # load pretrained model
@@ -598,15 +581,14 @@ def main(cfg: DictConfig) -> None:
     ) as ckpt_mngr:
         checkpoint = ckpt_mngr.restore(
             step=500,
-            args=ocp.args.StandardRestore(item=nnx.state(state_1.model.feature_extractor))
+            args=ocp.args.StandardRestore(item=nnx.state(state.model.feature_extractor))
         )
-        nnx.update(state_1.model.feature_extractor, checkpoint)
-        # nnx.update(state_2.model.feature_extractor, checkpoint)
+        nnx.update(state.model.feature_extractor, checkpoint)
         del checkpoint
 
     ckpt_options = ocp.CheckpointManagerOptions(
-        save_interval_steps=100,
-        max_to_keep=3,
+        save_interval_steps=50,
+        max_to_keep=6,
         step_format_fixed_length=3,
         enable_async_checkpointing=False
     )
@@ -641,7 +623,7 @@ def main(cfg: DictConfig) -> None:
         # enable an orbax checkpoint manager to save model's parameters
         with ocp.CheckpointManager(
             directory=ckpt_dir,
-            item_names=('model_1', 'model_2'),
+            item_names=('state', 'log_p_y', 'log_mult_prob'),
             options=ckpt_options
         ) as ckpt_mngr:
 
@@ -664,36 +646,23 @@ def main(cfg: DictConfig) -> None:
                 checkpoint = ckpt_mngr.restore(
                     step=start_epoch_id,
                     args=ocp.args.Composite(
-                        model_1=ocp.args.StandardRestore(
-                            item={
-                                'state': state_1.model,
-                                'log_p_y': log_p_y_1,
-                                'log_mult_prob': log_mult_prob_1
-                            }
-                        ),
-                        model_2=ocp.args.StandardRestore(
-                            item={
-                                'state': state_2.model,
-                                'log_p_y': log_p_y_2,
-                                'log_mult_prob': log_mult_prob_2
-                            }
-                        )
+                        state=ocp.args.StandardRestore(item=state.model),
+                        log_p_y=ocp.args.ArrayRestore(item=log_p_y),
+                        log_mult_prob=ocp.args.ArrayRestore(item=log_mult_prob)
                     )
                 )
 
-                state_1 = nnx.update(state_1.model, checkpoint.model_1['state'])
-                log_p_y_1 = checkpoint.model_1['log_p_y']
-                log_mult_prob_1 = checkpoint.model_1['log_mult_prob']
-
-                state_2 = nnx.update(state_2.model, checkpoint.model_2['state'])
-                log_p_y_1 = checkpoint.model_2['log_p_y']
-                log_mult_prob_1 = checkpoint.model_2['log_mult_prob']
+                state = nnx.update(state.model, checkpoint.state)
+                log_p_y = checkpoint.log_p_y
+                log_mult_prob = checkpoint.log_mult_prob
 
                 del checkpoint
             
             # region DATA LOADERS
-            dataloader_train_fn = partial(
-                initialize_dataloader,
+            iter_dataloader_train = initialize_dataloader(
+                data_source=source_train,
+                num_epochs=cfg.training.num_epochs - start_epoch_id + cfg.training.num_epochs_warmup + 1,
+                seed=random.randint(a=0, b=1_000),
                 shuffle=True,
                 batch_size=cfg.training.batch_size,
                 resize=cfg.data_augmentation.resize,
@@ -706,19 +675,7 @@ def main(cfg: DictConfig) -> None:
                 num_threads=cfg.data_loading.num_threads,
                 prefetch_size=cfg.data_loading.prefetch_size
             )
-            iter_dataloader_train_1 = dataloader_train_fn(
-                data_source=source_train,
-                num_epochs=cfg.training.num_epochs - start_epoch_id + cfg.training.num_epochs_warmup + 1,
-                seed=random.randint(a=0, b=1_000)
-            )
-            iter_dataloader_train_1 = iter(iter_dataloader_train_1)
-
-            iter_dataloader_train_2 = dataloader_train_fn(
-                data_source=source_train,
-                num_epochs=cfg.training.num_epochs - start_epoch_id + cfg.training.num_epochs_warmup + 1,
-                seed=random.randint(a=0, b=1_000)
-            )
-            iter_dataloader_train_2 = iter(iter_dataloader_train_2)
+            iter_dataloader_train = iter(iter_dataloader_train)
 
             data_loader_test = initialize_dataloader(
                 data_source=source_test,
@@ -750,25 +707,16 @@ def main(cfg: DictConfig) -> None:
                     colour='green',
                     disable=not cfg.data_loading.progress_bar
                 ):
-                    state_1, loss_1 = train_cross_entropy(
-                        optimizer=state_1,
-                        dataloader=iter_dataloader_train_1,
-                        p_y=jnp.exp(log_p_y_1),
+                    state, loss = train_cross_entropy(
+                        optimizer=state,
+                        dataloader=iter_dataloader_train,
+                        p_y=jnp.exp(log_p_y),
                         cfg=cfg
                     )
 
-                    state_2, loss_2 = train_cross_entropy(
-                        optimizer=state_2,
-                        dataloader=iter_dataloader_train_2,
-                        p_y=jnp.exp(log_p_y_2),
-                        cfg=cfg
-                    )
-
-                    mlflow.log_metrics(
-                        metrics={
-                            'warmup/loss_1': loss_1,
-                            'warmup/loss_2': loss_2
-                        },
+                    mlflow.log_metric(
+                        key='warmup/loss',
+                        value=loss,
                         step=epoch_id + 1,
                         synchronous=False
                     )
@@ -785,31 +733,21 @@ def main(cfg: DictConfig) -> None:
             disable=not cfg.data_loading.progress_bar
         ):
             if (epoch_id + 1) % cfg.hparams.relabeling_every_n_epochs == 0:
-                idx_loader1 = (
+                idx_loader = (
                     grain.MapDataset.range(start=0, stop=cfg.dataset.length.train, step=1)
                         .shuffle(seed=random.randint(a=0, b=100_000))  # Shuffles globally.
                         .map(lambda x: x)  # Maps each element.
                         .batch(batch_size=cfg.hparams.num_samples_search_knn)  # Batches consecutive elements.
                 )
-                idx_loader2 = (
-                    grain.MapDataset.range(start=0, stop=cfg.dataset.length.train, step=1)
-                        .shuffle(seed=random.randint(a=0, b=100_000))  # Shuffles globally.
-                        .map(lambda x: x)  # Maps each element.
-                        .batch(batch_size=cfg.hparams.num_samples_search_knn)  # Batches consecutive elements.
-                )
-
                 # initialize nearest neighbor matrix and coding matrix
-                nn_matrix_1 = jnp.zeros(
+                nn_matrix = jnp.zeros(
                     shape=(cfg.dataset.length.train, cfg.hparams.num_nearest_neighbrs),
                     dtype=jnp.int32
                 )  # (N, K)
-                coding_matrix_1 = jnp.zeros_like(a=nn_matrix_1, dtype=jnp.float32)  # (N, K)
+                coding_matrix = jnp.zeros_like(a=nn_matrix, dtype=jnp.float32)  # (N, K)
 
-                nn_matrix_2 = jnp.zeros_like(a=nn_matrix_1, dtype=jnp.int32)
-                coding_matrix_2 = jnp.zeros_like(a=nn_matrix_1, dtype=jnp.float32)
-
-                for sample_indices_1, sample_indices_2 in tqdm(
-                    iterable=zip(idx_loader1, idx_loader2),
+                for sample_indices in tqdm(
+                    iterable=idx_loader,
                     total=int(jnp.ceil(cfg.dataset.length.train / cfg.hparams.num_samples_search_knn)),
                     desc='Neighboring',
                     ncols=80,
@@ -819,71 +757,39 @@ def main(cfg: DictConfig) -> None:
                     disable=not cfg.data_loading.progress_bar
                 ):
                     # region FIND K-NN and CODING MATRIX
-                    nn_matrix_1_temp, coding_matrix_1_temp = get_nn_coding_matrix(
-                        model=state_1.model,
-                        sample_indices=sample_indices_1,
+                    nn_matrix_temp, coding_matrix_temp = get_nn_coding_matrix(
+                        model=state.model,
+                        sample_indices=sample_indices,
                         cfg=cfg
                     )
 
-                    nn_matrix_1 = nn_matrix_1.at[sample_indices_1].set(values=nn_matrix_1_temp.astype(jnp.int32))
-                    coding_matrix_1 = coding_matrix_1.at[sample_indices_1].set(values=coding_matrix_1_temp)
-
-                    nn_matrix_2_temp, coding_matrix_2_temp = get_nn_coding_matrix(
-                        model=state_2.model,
-                        sample_indices=sample_indices_2,
-                        cfg=cfg
-                    )
-
-                    nn_matrix_2 = nn_matrix_2.at[sample_indices_2].set(values=nn_matrix_2_temp.astype(jnp.int32))
-                    coding_matrix_2 = coding_matrix_2.at[sample_indices_2].set(values=coding_matrix_2_temp)
+                    nn_matrix = nn_matrix.at[sample_indices].set(values=nn_matrix_temp.astype(jnp.int32))
+                    coding_matrix = coding_matrix.at[sample_indices].set(values=coding_matrix_temp)
                     # endregion
 
                 # region RE-LABEL
-                log_p_y_nn_1, log_mult_prob_nn_1 = relabel_data(
-                    log_p_y=log_p_y_1,
-                    log_mult_prob=log_mult_prob_1,
-                    nn_idx=nn_matrix_1,
-                    coding_matrix=coding_matrix_1,
-                    cfg=cfg
-                )
-
-                log_p_y_nn_2, log_mult_prob_nn_2 = relabel_data(
-                    log_p_y=log_p_y_2,
-                    log_mult_prob=log_mult_prob_2,
-                    nn_idx=nn_matrix_2,
-                    coding_matrix=coding_matrix_2,
+                log_p_y_nn, log_mult_prob_nn = relabel_data(
+                    log_p_y=log_p_y,
+                    log_mult_prob=log_mult_prob,
+                    nn_idx=nn_matrix,
+                    coding_matrix=coding_matrix,
                     cfg=cfg
                 )
                 # endregion
 
-                log_p_y_1, log_mult_prob_1 = update_mult_mixture(
-                    log_p_y=log_p_y_1,
-                    log_mult_prob=log_mult_prob_1,
-                    log_p_y_nn=log_p_y_nn_1,
-                    log_mult_prob_nn=log_mult_prob_nn_1,
-                    mu=cfg.hparams.mu
-                )
-
-                log_p_y_2, log_mult_prob_2 = update_mult_mixture(
-                    log_p_y=log_p_y_2,
-                    log_mult_prob=log_mult_prob_2,
-                    log_p_y_nn=log_p_y_nn_2,
-                    log_mult_prob_nn=log_mult_prob_nn_2,
+                log_p_y, log_mult_prob = update_mult_mixture(
+                    log_p_y=log_p_y,
+                    log_mult_prob=log_mult_prob,
+                    log_p_y_nn=log_p_y_nn,
+                    log_mult_prob_nn=log_mult_prob_nn,
                     mu=cfg.hparams.mu
                 )
 
             # region TRAIN models on relabelled data
-            state_1, loss_1 = train_cross_entropy(
-                optimizer=state_1,
-                dataloader=iter_dataloader_train_1,
-                p_y=jnp.exp(log_p_y_2),
-                cfg=cfg
-            )
-
-            state_2, loss_2 = train_cross_entropy(
-                optimizer=state_2,
-                dataloader=iter_dataloader_train_2,
-                p_y=jnp.exp(log_p_y_1),
+            state, loss = train_cross_entropy(
+                optimizer=state,
+                dataloader=iter_dataloader_train,
+                p_y=jnp.exp(log_p_y),
                 cfg=cfg
             )
             # endregion
@@ -892,38 +798,23 @@ def main(cfg: DictConfig) -> None:
             ckpt_mngr.save(
                 step=epoch_id + 1,
                 args=ocp.args.Composite(
-                    model_1=ocp.args.StandardSave({
-                        'state': nnx.state(state_1.model),
-                        'log_p_y': log_p_y_1,
-                        'log_mult_prob': log_mult_prob_1
-                    }),
-                    model_2=ocp.args.StandardSave({
-                        'state': nnx.state(state_2.model),
-                        'log_p_y': log_p_y_2,
-                        'log_mult_prob': log_mult_prob_2
-                    })
+                    state=ocp.args.StandardSave(nnx.state(state.model)),
+                    log_p_y=ocp.args.ArraySave(log_p_y),
+                    log_mult_prob=ocp.args.ArraySave(log_mult_prob)
                 )
             )
 
             # evaluate
-            acc_1 = evaluate(
-                model=state_1.model,
-                dataloader=data_loader_test,
-                cfg=cfg
-            )
-            acc_2 = evaluate(
-                model=state_2.model,
+            accuracy = evaluate(
+                model=state.model,
                 dataloader=data_loader_test,
                 cfg=cfg
             )
 
             mlflow.log_metrics(
                 metrics={
-                    'loss/model_1': loss_1,
-                    'loss/model_2': loss_2,
-                    'accuracy/model_1': acc_1,
-                    'accuracy/model_2': acc_2,
-                    'accuracy/average': 0.5 * (acc_1 + acc_2)
+                    'loss': loss,
+                    'accuracy': accuracy
                 },
                 step=epoch_id + 1,
                 synchronous=False
