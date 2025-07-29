@@ -155,7 +155,7 @@ def sub_sparse_matrix_from_row_indices(mat: sparse.BCOO, indices: jax.Array, n_b
     return m
 
 
-def get_knn_indices(xb: np.ndarray, num_nn: int) -> np.ndarray:
+def get_knn_indices(xb: np.ndarray, num_nn: int, ids: np.ndarray) -> np.ndarray:
     """find the indices of k-nearest neighbours
 
     Args:
@@ -171,7 +171,7 @@ def get_knn_indices(xb: np.ndarray, num_nn: int) -> np.ndarray:
     index_id_map = faiss.IndexIDMap(index_flat)  # translates ids when adding and searching
     gpu_index_flat = faiss.index_cpu_to_gpu(provider=res, device=0, index=index_id_map)  # make it into a gpu index
 
-    ids = np.arange(stop=xb.shape[0])
+    # ids = np.arange(stop=xb.shape[0])
 
     gpu_index_flat.add_with_ids(xb, ids)  # add vectors to the index
 
