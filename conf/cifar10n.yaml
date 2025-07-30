@@ -33,7 +33,7 @@ pretrained:
 hparams:
   num_samples_search_knn: 10000
   num_nearest_neighbrs: 100
-  mu: 0.5
+  mu: 0.9
   relabeling_every_n_epochs: 10
   batch_size_em: 100
   num_em_iter: 10
