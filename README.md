@@ -8,52 +8,35 @@ This repository contains the code development for the paper [Towards the Identif
 The code mainly relies on JAX - a composable machine learning framework developed by Google. In particular, the implementation contains the following packages:
 - `jax` - a composable machine learning framework
 - `flax` - neural networks with JAX
-- `tensorflow` - an end-to-end machine learning platform
-- `tensorflow-datasets` (a.k.a. `tfds`) - high-level wrapper for `tensorflow.data`
+- `grain` - a framework agnostic data loading
+- `albumentations` - a library for image augmentations (similar to `torchvision`)
 - `tensorflow-probability` - a library for probabilistic reasoning and statistical analysis
 - `faiss-gpu` - similarity search developed by Facebook AI
 - `jaxopt` - an optimisation in JAX
-- `aim` - a library for experiment tracking,
+- `hydra-core` - a library for configuration
+- `mlflow` - a library manage and track experiments.
 
-and many other packages. Further details can be referred to the [requirements.txt](requirements.txt) included in this repository. Please follow the instructions of JAX and TensorFlow to install those packages since their CPU and GPU versions might be different.
+Further details can be referred to the [requirements.txt](requirements.txt) included in this repository. Please follow the instructions of JAX and TensorFlow to install those packages since their CPU and GPU versions might be different.
+
+**Do not install packages directly from `requirements.txt`**
+- For `jax`, please follow the instruction in its [installation guide](https://docs.jax.dev/en/latest/installation.html) to install the GPU version
+- For `faiss-gpu`, it is stopped to be published on https://pypi.org/project/. Please either compile from source or download its prebuilt wheel at https://github.com/kyamagu/faiss-wheels/releases/tag/v1.7.3 and install locally. **Note:** after installing `faiss-gpu`, please downgrade `numpy` to the version specified in `requirements.txt` because this version of `faiss-gpu` is pinned to `numpy` 1.x.
 
 ## Dataset structure
 A dataset has the following folder structure:
-```
-path/to/dataset/
-    train/
-        label_0/
-            image_0_1.ext
-            image_0_2.ext
-            ...
-        label_1/
-            ...
-        ...
-    test/
-        label_0/
-            image_0_1.ext
-            image_0_2.ext
-            ...
-        label_1/
-            ...
-        ...
-    split/
-        clean_validation  # csv-file for evaluation set
-        label_noise_0.2  # csv-file for training set with noise rate
-        label_noise_0.4
-        ...
+```bash
+[
+    {
+        "file": "<path_to_one_image_file>",
+        "label": [2, 9, 0]
+    },
+]
 ```
 
-Each of the datasets used in the implemetation is characterised by a `csv` file which have a similar structure as in `Red/Blue mini-ImageNet`. Such a `csv` file has two coumns:
-```
-relative/path/of/image_0_1.ext 8
-relative/path/of/image_0_2.ext 6
-...
-```
-where the first column is the relative path of a sample and the second column is its corresponding noisy label.
+Each of the datasets used in the implemetation is characterised by a `json` file.
 
 ## Experiment tracking
-Experiments are tracked and managed by `aim`. To see the result, open a terminal and run the following command:
-```linux
-aim up --repo logs
+Experiments are tracked and managed in `mlflow`. To see the result, open a terminal and run the following command:
+```bash
+bash mlflow_server.sh
 ```
