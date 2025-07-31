@@ -25,7 +25,6 @@ from pathlib import Path
 
 from tqdm import tqdm
 import logging
-from typing import Callable
 
 import hydra
 from omegaconf import DictConfig, OmegaConf
@@ -38,27 +37,20 @@ from utils import init_tx, initialize_dataloader
 from mixup import mixup_data
 
 
-class PretrainedModel(nnx.Module):
+class FeatureEmbeddedModel(nnx.Module):
     def __init__(
         self,
-        model_fn: Callable,
-        feature_dim: int,
+        feature_extractor: nnx.Module,
         num_classes: int,
         rngs: nnx.Rngs,
-        dropout_rate: float,
         dtype: jnp.dtype = jnp.float32
     ) -> None:
         super().__init__()
 
-        self.feature_extractor = model_fn(
-            num_classes=feature_dim,
-            rngs=rngs,
-            dropout_rate=dropout_rate,
-            dtype=dtype
-        )
+        self.feature_extractor = feature_extractor
 
         self.clf = nnx.Linear(
-            in_features=feature_dim,
+            in_features=feature_extractor.clf.out_features,
             out_features=num_classes,
             dtype=dtype,
             rngs=rngs
@@ -122,7 +114,12 @@ def get_soft_noisy_labels(
 
         noisy_labels_onehot = jax.nn.one_hot(x=noisy_labels, num_classes=num_classes)
 
-        noisy_labels_aggregate = jnp.mean(a=noisy_labels_onehot, axis=0)
+        if noisy_labels_onehot.ndim == 1:
+            noisy_labels_aggregate = noisy_labels_onehot
+        elif noisy_labels_onehot.ndim == 2:
+            noisy_labels_aggregate = jnp.mean(a=noisy_labels_onehot, axis=0)
+        else:
+            raise ValueError('Dimensions of labels are incorrect. It only accept either an int scalar or a list of int')
 
         p_y_1 = p_y_1.at[i].set(values=noisy_labels_aggregate)
 
@@ -146,30 +143,36 @@ def cross_entropy_loss(model: nnx.Module, x: jax.Array, y: jax.Array) -> jax.Arr
 
 
 @nnx.jit
-def train_step(x: jax.Array, y: jax.Array, optimizer: nnx.Optimizer):
+def train_step(
+    x: jax.Array,
+    y: jax.Array,
+    model: nnx.Module,
+    optimizer: nnx.Optimizer
+) -> tuple[nnx.Module, nnx.Optimizer, jax.Array]:
     """
     """
     grad_value_fn = nnx.value_and_grad(f=cross_entropy_loss, argnums=0)
-    loss, grads = grad_value_fn(optimizer.model, x, y)
+    loss, grads = grad_value_fn(model, x, y)
 
     optimizer.update(grads=grads)
 
-    return (optimizer, loss)
+    return (model, optimizer, loss)
 
 
 def train_cross_entropy(
+    model: nnx.Module,
     optimizer: nnx.Optimizer,
     dataloader: grain.DatasetIterator,
     p_y: jax.Array,
     cfg: DictConfig
-) -> tuple[nnx.Optimizer, jax.Array]:
+) -> tuple[nnx.Module, nnx.Optimizer, jax.Array]:
     """train a model with cross-entropy loss
     """
     # metric to track the training loss
     loss_accum = nnx.metrics.Average()
 
     # set train mode
-    optimizer.model.train()
+    model.train()
 
     for _ in tqdm(
         iterable=range(cfg.dataset.length.train // cfg.training.batch_size),
@@ -190,14 +193,14 @@ def train_cross_entropy(
             x_mixed, y = mixup_data(x, y, key, cfg.mixup.beta.a, cfg.mixup.beta.b)
             x = jnp.astype(x_mixed, x.dtype)
 
-        optimizer, loss = train_step(x=x, y=y, optimizer=optimizer)
+        model, optimizer, loss = train_step(x=x, y=y, model=model, optimizer=optimizer)
 
         if jnp.isnan(loss):
             raise ValueError('Training loss is NaN.')
 
         loss_accum.update(values=loss)
 
-    return (optimizer, loss_accum.compute())
+    return (model, optimizer, loss_accum.compute())
 
 
 def evaluate(
@@ -451,7 +454,7 @@ def get_nn_coding_matrix(
     # find K nearest-neighbours
     knn_indices = get_knn_indices(
         xb=np.asarray(features),
-        num_nn=cfg.hparams.num_nearest_neighbrs,
+        num_nn=cfg.hparams.num_nearest_neighbors,
         ids=sample_indices
     )
 
@@ -485,7 +488,7 @@ def main(cfg: DictConfig) -> None:
     """Main function
     """
     # region ENVIRONMENT
-    jax.config.update('jax_disable_jit', cfg.jax.disable_jit)
+    jax.config.update('jax_disable_jit', not cfg.jax.jit)
     jax.config.update('jax_platforms', cfg.jax.platform)
 
     os.environ['XLA_PYTHON_CLIENT_MEM_FRACTION'] = str(cfg.jax.mem)
@@ -542,23 +545,19 @@ def main(cfg: DictConfig) -> None:
     # endregion
 
     # region MODELS
-    # model = hydra.utils.instantiate(config=cfg.model)(
-    #     num_classes=cfg.dataset.num_classes,
-    #     rngs=nnx.Rngs(jax.random.PRNGKey(seed=random.randint(a=0, b=100))),
-    #     dropout_rate=cfg.training.dropout_rate,
-    #     dtype=eval(cfg.jax.dtype)
-    # )
-    model = PretrainedModel(
-        model_fn=hydra.utils.instantiate(config=cfg.model),
-        feature_dim=cfg.pretrained.feature_dim,
+    model_1 = FeatureEmbeddedModel(
+        feature_extractor=hydra.utils.instantiate(config=cfg.model)(
+            num_classes=cfg.hparams.feature_dim,
+            rngs=nnx.Rngs(jax.random.PRNGKey(seed=random.randint(a=0, b=100))),
+            dropout_rate=cfg.training.dropout_rate,
+            dtype=eval(cfg.jax.dtype)
+        ),
         num_classes=cfg.dataset.num_classes,
-        dropout_rate=cfg.training.dropout_rate,
         dtype=eval(cfg.jax.dtype),
         rngs=nnx.Rngs(jax.random.PRNGKey(seed=random.randint(a=0, b=100)))
     )
-
-    state_1 = nnx.Optimizer(
-        model=model,
+    optimizer_1 = nnx.Optimizer(
+        model=model_1,
         tx=init_tx(
             dataset_length=len(source_train),
             lr=cfg.training.lr,
@@ -568,10 +567,23 @@ def main(cfg: DictConfig) -> None:
             momentum=cfg.training.momentum,
             clipped_norm=cfg.training.clipped_norm,
             key=random.randint(a=0, b=100)
-        )
+        ),
+        wrt=nnx.Param
     )
-    state_2 = nnx.Optimizer(
-        model=model,
+
+    model_2 = FeatureEmbeddedModel(
+        feature_extractor=hydra.utils.instantiate(config=cfg.model)(
+            num_classes=cfg.pretrained.feature_dim,
+            rngs=nnx.Rngs(jax.random.PRNGKey(seed=random.randint(a=0, b=100))),
+            dropout_rate=cfg.training.dropout_rate,
+            dtype=eval(cfg.jax.dtype)
+        ),
+        num_classes=cfg.dataset.num_classes,
+        dtype=eval(cfg.jax.dtype),
+        rngs=nnx.Rngs(jax.random.PRNGKey(seed=random.randint(a=0, b=100)))
+    )
+    optimizer_2 = nnx.Optimizer(
+        model=model_2,
         tx=init_tx(
             dataset_length=len(source_train),
             lr=cfg.training.lr,
@@ -581,32 +593,13 @@ def main(cfg: DictConfig) -> None:
             momentum=cfg.training.momentum,
             clipped_norm=cfg.training.clipped_norm,
             key=random.randint(a=0, b=100)
-        )
+        ),
+        wrt=nnx.Param
     )
-
-    del model
-
-    # load pretrained model
-    with ocp.CheckpointManager(
-        directory=cfg.pretrained.path,
-        options=ocp.CheckpointManagerOptions(
-            save_interval_steps=100,
-            max_to_keep=1,
-            step_format_fixed_length=3,
-            enable_async_checkpointing=True
-        )
-    ) as ckpt_mngr:
-        checkpoint = ckpt_mngr.restore(
-            step=500,
-            args=ocp.args.StandardRestore(item=nnx.state(state_1.model.feature_extractor))
-        )
-        nnx.update(state_1.model.feature_extractor, checkpoint)
-        # nnx.update(state_2.model.feature_extractor, checkpoint)
-        del checkpoint
 
     ckpt_options = ocp.CheckpointManagerOptions(
-        save_interval_steps=100,
-        max_to_keep=3,
+        save_interval_steps=50,
+        max_to_keep=10,
         step_format_fixed_length=3,
         enable_async_checkpointing=False
     )
@@ -614,7 +607,7 @@ def main(cfg: DictConfig) -> None:
 
     # region EXPERIMENT TRACKING
     # create log folder if it does not exist
-    logging.info(msg='Initialise AIM repository to store logs')
+    logging.info(msg='Initialise directory to store logs')
     if not os.path.exists(path=cfg.experiment.logdir):
         logging.info(
             msg=f'Logging folder not found. Make a logdir at {cfg.experiment.logdir}'
@@ -626,153 +619,148 @@ def main(cfg: DictConfig) -> None:
     mlflow.disable_system_metrics_logging()
     # endregion
 
-    with mlflow.start_run(
-        run_id=cfg.experiment.run_id,
-        log_system_metrics=False
-    ) as mlflow_run:
-        # append run id into the artifact path
-        ckpt_dir = os.path.join(
+    with mlflow.start_run(run_id=cfg.experiment.run_id, log_system_metrics=False) as mlflow_run, \
+    ocp.CheckpointManager(
+        directory=os.path.join(
             os.getcwd(),
             cfg.experiment.logdir,
             cfg.experiment.name,
             mlflow_run.info.run_id
+        ),
+        item_names=('data_1', 'data_2'),
+        options=ckpt_options
+    ) as ckpt_mngr:
+
+        if cfg.experiment.run_id is None:
+            start_epoch_id = 0
+
+            # log hyper-parameters
+            mlflow.log_params(
+                params=flatten_dict(xs=OmegaConf.to_container(cfg=cfg), sep='.')
+            )
+
+            # log source code
+            mlflow.log_artifact(
+                local_path=os.path.abspath(path=__file__),
+                artifact_path='source_code'
+            )
+        else:
+            start_epoch_id = ckpt_mngr.latest_step()
+
+            checkpoint = ckpt_mngr.restore(
+                step=start_epoch_id,
+                args=ocp.args.Composite(
+                    data_1=ocp.args.StandardRestore(
+                        item={
+                            'state': nnx.state(model_1),
+                            'log_p_y': log_p_y_1,
+                            'log_mult_prob': log_mult_prob_1
+                        }
+                    ),
+                    data_2=ocp.args.StandardRestore(
+                        item={
+                            'state': nnx.state(model_2),
+                            'log_p_y': log_p_y_2,
+                            'log_mult_prob': log_mult_prob_2
+                        }
+                    )
+                )
+            )
+
+            nnx.update(model_1, checkpoint['data_1']['state'])
+            log_p_y_1 = checkpoint.model_1['log_p_y']
+            log_mult_prob_1 = checkpoint.model_1['log_mult_prob']
+
+            nnx.update(model_2, checkpoint['data_2']['state'])
+            log_p_y_1 = checkpoint.model_2['log_p_y']
+            log_mult_prob_1 = checkpoint.model_2['log_mult_prob']
+
+            del checkpoint
+            
+        # region DATA LOADERS
+        dataloader_train_fn = partial(
+            initialize_dataloader,
+            shuffle=True,
+            batch_size=cfg.training.batch_size,
+            resize=cfg.data_augmentation.resize,
+            padding_px=cfg.data_augmentation.padding_px,
+            crop_size=cfg.data_augmentation.crop_size,
+            mean=cfg.data_augmentation.mean,
+            std=cfg.data_augmentation.std,
+            p_flip=cfg.data_augmentation.prob_random_flip,
+            num_workers=cfg.data_loading.num_workers,
+            num_threads=cfg.data_loading.num_threads,
+            prefetch_size=cfg.data_loading.prefetch_size
         )
+        iter_dataloader_train_1 = dataloader_train_fn(
+            data_source=source_train,
+            num_epochs=cfg.training.num_epochs - start_epoch_id + cfg.training.num_epochs_warmup + 1,
+            seed=random.randint(a=0, b=1_000)
+        )
+        iter_dataloader_train_1 = iter(iter_dataloader_train_1)
 
-        # enable an orbax checkpoint manager to save model's parameters
-        with ocp.CheckpointManager(
-            directory=ckpt_dir,
-            item_names=('model_1', 'model_2'),
-            options=ckpt_options
-        ) as ckpt_mngr:
+        iter_dataloader_train_2 = dataloader_train_fn(
+            data_source=source_train,
+            num_epochs=cfg.training.num_epochs - start_epoch_id + cfg.training.num_epochs_warmup + 1,
+            seed=random.randint(a=0, b=1_000)
+        )
+        iter_dataloader_train_2 = iter(iter_dataloader_train_2)
 
-            if cfg.experiment.run_id is None:
-                start_epoch_id = 0
-
-                # log hyper-parameters
-                mlflow.log_params(
-                    params=flatten_dict(xs=OmegaConf.to_container(cfg=cfg), sep='.')
+        data_loader_test = initialize_dataloader(
+            data_source=source_test,
+            num_epochs=1,
+            shuffle=False,
+            seed=0,
+            batch_size=cfg.training.batch_size,
+            resize=cfg.data_augmentation.crop_size,
+            padding_px=None,
+            crop_size=None,
+            mean=cfg.data_augmentation.mean,
+            std=cfg.data_augmentation.std,
+            p_flip=None,
+            is_color_img=True,
+            num_workers=cfg.data_loading.num_workers,
+            num_threads=cfg.data_loading.num_threads,
+            prefetch_size=cfg.data_loading.prefetch_size
+        )
+        # endregion
+        
+        # region WARMUP
+        if start_epoch_id == 0:
+            for epoch_id in tqdm(
+                iterable=range(cfg.training.num_epochs_warmup),
+                desc='Warmup',
+                ncols=80,
+                leave=True,
+                position=0,
+                colour='green',
+                disable=not cfg.data_loading.progress_bar
+            ):
+                model_1, optimizer_1, loss_1 = train_cross_entropy(
+                    model=model_1,
+                    optimizer=optimizer_1,
+                    dataloader=iter_dataloader_train_1,
+                    p_y=jnp.exp(log_p_y_1),
+                    cfg=cfg
                 )
 
-                # log source code
-                mlflow.log_artifact(
-                    local_path=os.path.abspath(path=__file__),
-                    artifact_path='source_code'
-                )
-            else:
-                start_epoch_id = ckpt_mngr.latest_step()
-
-                checkpoint = ckpt_mngr.restore(
-                    step=start_epoch_id,
-                    args=ocp.args.Composite(
-                        model_1=ocp.args.StandardRestore(
-                            item={
-                                'state': state_1.model,
-                                'log_p_y': log_p_y_1,
-                                'log_mult_prob': log_mult_prob_1
-                            }
-                        ),
-                        model_2=ocp.args.StandardRestore(
-                            item={
-                                'state': state_2.model,
-                                'log_p_y': log_p_y_2,
-                                'log_mult_prob': log_mult_prob_2
-                            }
-                        )
-                    )
+                model_2, optimizer_2, loss_2 = train_cross_entropy(
+                    model=model_2,
+                    optimizer=optimizer_2,
+                    dataloader=iter_dataloader_train_2,
+                    p_y=jnp.exp(log_p_y_2),
+                    cfg=cfg
                 )
 
-                state_1 = nnx.update(state_1.model, checkpoint.model_1['state'])
-                log_p_y_1 = checkpoint.model_1['log_p_y']
-                log_mult_prob_1 = checkpoint.model_1['log_mult_prob']
-
-                state_2 = nnx.update(state_2.model, checkpoint.model_2['state'])
-                log_p_y_1 = checkpoint.model_2['log_p_y']
-                log_mult_prob_1 = checkpoint.model_2['log_mult_prob']
-
-                del checkpoint
-            
-            # region DATA LOADERS
-            dataloader_train_fn = partial(
-                initialize_dataloader,
-                shuffle=True,
-                batch_size=cfg.training.batch_size,
-                resize=cfg.data_augmentation.resize,
-                padding_px=cfg.data_augmentation.padding_px,
-                crop_size=cfg.data_augmentation.crop_size,
-                mean=cfg.data_augmentation.mean,
-                std=cfg.data_augmentation.std,
-                p_flip=cfg.data_augmentation.prob_random_flip,
-                num_workers=cfg.data_loading.num_workers,
-                num_threads=cfg.data_loading.num_threads,
-                prefetch_size=cfg.data_loading.prefetch_size
-            )
-            iter_dataloader_train_1 = dataloader_train_fn(
-                data_source=source_train,
-                num_epochs=cfg.training.num_epochs - start_epoch_id + cfg.training.num_epochs_warmup + 1,
-                seed=random.randint(a=0, b=1_000)
-            )
-            iter_dataloader_train_1 = iter(iter_dataloader_train_1)
-
-            iter_dataloader_train_2 = dataloader_train_fn(
-                data_source=source_train,
-                num_epochs=cfg.training.num_epochs - start_epoch_id + cfg.training.num_epochs_warmup + 1,
-                seed=random.randint(a=0, b=1_000)
-            )
-            iter_dataloader_train_2 = iter(iter_dataloader_train_2)
-
-            data_loader_test = initialize_dataloader(
-                data_source=source_test,
-                num_epochs=1,
-                shuffle=False,
-                seed=0,
-                batch_size=cfg.training.batch_size,
-                resize=cfg.data_augmentation.crop_size,
-                padding_px=None,
-                crop_size=None,
-                mean=cfg.data_augmentation.mean,
-                std=cfg.data_augmentation.std,
-                p_flip=None,
-                is_color_img=True,
-                num_workers=cfg.data_loading.num_workers,
-                num_threads=cfg.data_loading.num_threads,
-                prefetch_size=cfg.data_loading.prefetch_size
-            )
-            # endregion
-            
-            # region WARMUP
-            if start_epoch_id == 0:
-                for epoch_id in tqdm(
-                    iterable=range(cfg.training.num_epochs_warmup),
-                    desc='Warmup',
-                    ncols=80,
-                    leave=True,
-                    position=0,
-                    colour='green',
-                    disable=not cfg.data_loading.progress_bar
-                ):
-                    state_1, loss_1 = train_cross_entropy(
-                        optimizer=state_1,
-                        dataloader=iter_dataloader_train_1,
-                        p_y=jnp.exp(log_p_y_1),
-                        cfg=cfg
-                    )
-
-                    state_2, loss_2 = train_cross_entropy(
-                        optimizer=state_2,
-                        dataloader=iter_dataloader_train_2,
-                        p_y=jnp.exp(log_p_y_2),
-                        cfg=cfg
-                    )
-
-                    mlflow.log_metrics(
-                        metrics={
-                            'warmup/loss_1': loss_1,
-                            'warmup/loss_2': loss_2
-                        },
-                        step=epoch_id + 1,
-                        synchronous=False
-                    )
-            # endergion
+                mlflow.log_metrics(
+                    metrics={
+                        'warmup/loss_1': loss_1,
+                        'warmup/loss_2': loss_2
+                    },
+                    step=epoch_id + 1,
+                    synchronous=False
+                )
+        # endergion
 
         # region TRAINING
         for epoch_id in tqdm(
@@ -800,7 +788,7 @@ def main(cfg: DictConfig) -> None:
 
                 # initialize nearest neighbor matrix and coding matrix
                 nn_matrix_1 = jnp.zeros(
-                    shape=(cfg.dataset.length.train, cfg.hparams.num_nearest_neighbrs),
+                    shape=(cfg.dataset.length.train, cfg.hparams.num_nearest_neighbors),
                     dtype=jnp.int32
                 )  # (N, K)
                 coding_matrix_1 = jnp.zeros_like(a=nn_matrix_1, dtype=jnp.float32)  # (N, K)
@@ -820,7 +808,7 @@ def main(cfg: DictConfig) -> None:
                 ):
                     # region FIND K-NN and CODING MATRIX
                     nn_matrix_1_temp, coding_matrix_1_temp = get_nn_coding_matrix(
-                        model=state_1.model,
+                        model=model_1,
                         sample_indices=sample_indices_1,
                         cfg=cfg
                     )
@@ -829,7 +817,7 @@ def main(cfg: DictConfig) -> None:
                     coding_matrix_1 = coding_matrix_1.at[sample_indices_1].set(values=coding_matrix_1_temp)
 
                     nn_matrix_2_temp, coding_matrix_2_temp = get_nn_coding_matrix(
-                        model=state_2.model,
+                        model=model_2,
                         sample_indices=sample_indices_2,
                         cfg=cfg
                     )
@@ -873,15 +861,17 @@ def main(cfg: DictConfig) -> None:
                 )
 
             # region TRAIN models on relabelled data
-            state_1, loss_1 = train_cross_entropy(
-                optimizer=state_1,
+            model_1, optimizer_1, loss_1 = train_cross_entropy(
+                model=model_1,
+                optimizer=optimizer_1,
                 dataloader=iter_dataloader_train_1,
                 p_y=jnp.exp(log_p_y_2),
                 cfg=cfg
             )
 
-            state_2, loss_2 = train_cross_entropy(
-                optimizer=state_2,
+            model_2, optimizer_2, loss_2 = train_cross_entropy(
+                model=model_1,
+                optimizer=optimizer_2,
                 dataloader=iter_dataloader_train_2,
                 p_y=jnp.exp(log_p_y_1),
                 cfg=cfg
@@ -892,13 +882,13 @@ def main(cfg: DictConfig) -> None:
             ckpt_mngr.save(
                 step=epoch_id + 1,
                 args=ocp.args.Composite(
-                    model_1=ocp.args.StandardSave({
-                        'state': nnx.state(state_1.model),
+                    data_1=ocp.args.StandardSave({
+                        'state': nnx.state(model_1),
                         'log_p_y': log_p_y_1,
                         'log_mult_prob': log_mult_prob_1
                     }),
-                    model_2=ocp.args.StandardSave({
-                        'state': nnx.state(state_2.model),
+                    data_2=ocp.args.StandardSave({
+                        'state': nnx.state(model_2),
                         'log_p_y': log_p_y_2,
                         'log_mult_prob': log_mult_prob_2
                     })
@@ -907,12 +897,12 @@ def main(cfg: DictConfig) -> None:
 
             # evaluate
             acc_1 = evaluate(
-                model=state_1.model,
+                model=model_1,
                 dataloader=data_loader_test,
                 cfg=cfg
             )
             acc_2 = evaluate(
-                model=state_2.model,
+                model=model_2,
                 dataloader=data_loader_test,
                 cfg=cfg
             )
