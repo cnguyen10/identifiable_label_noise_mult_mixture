@@ -7,10 +7,6 @@ import optax
 
 from tensorflow_probability.substrates import jax as tfp
 
-import faiss  # facebook similarity search
-
-import numpy as np
-
 from functools import partial
 
 import grain.python as grain
@@ -155,28 +151,50 @@ def sub_sparse_matrix_from_row_indices(mat: sparse.BCOO, indices: jax.Array, n_b
     return m
 
 
-def get_knn_indices(xb: np.ndarray, num_nn: int, ids: np.ndarray) -> np.ndarray:
+@partial(jax.jit, static_argnames=('k', 'recall_target'))
+def l2_approx_nn(
+        qy: jax.Array,
+        db: jax.Array,
+        k: int,
+        recall_target: float = 0.95) -> tuple[jax.Array, jax.Array]:
+    """approximate nearest neighbour search
+
+    Args:
+        qy: queried samples
+        db: the database of samples to search for nearest neighbours
+        k: the number of neighbours
+        recall_target: the target of the recall in the approximation
+
+    Returns:
+        dists: distances
+        neighbours: the indices of neighbours
+    """
+    half_db_norm_sq = jnp.linalg.norm(db, axis=1)**2 / 2
+    dists = half_db_norm_sq - jax.lax.dot(lhs=qy, rhs=db.transpose())
+
+    return jax.lax.approx_min_k(dists, k=k, recall_target=recall_target)
+
+
+def get_knn_indices(
+        xb: jax.Array,
+        num_nn: int,
+        ids: jax.Array) -> jax.Array:
     """find the indices of k-nearest neighbours
 
     Args:
         xb: the matrix where each row contains feature vector of one datum
-        args:
+        k: the number of nearest neighbours (excluding the sample)
+        ids: the original indices of the input
 
     Returns:
         index_matrix: matrix containing indices of nearest neighbours
     """
-    res = faiss.StandardGpuResources()  # use a single GPU
+    # perform kNN
+    # +1 due to excluding sample itself
+    _, index_matrix = l2_approx_nn(xb, xb, num_nn + 1)
 
-    index_flat = faiss.IndexFlatL2(xb.shape[-1])  # build a flat (CPU) index
-    index_id_map = faiss.IndexIDMap(index_flat)  # translates ids when adding and searching
-    gpu_index_flat = faiss.index_cpu_to_gpu(provider=res, device=0, index=index_id_map)  # make it into a gpu index
-
-    # ids = np.arange(stop=xb.shape[0])
-
-    gpu_index_flat.add_with_ids(xb, ids)  # add vectors to the index
-
-    # start the nearest-neighbour search
-    _, index_matrix = gpu_index_flat.search(x=xb, k=num_nn + 1)  # adding 1 is because the return includes the sample itself
+    # map the indices back to the original indices
+    index_matrix = ids[index_matrix]
 
     return index_matrix[:, 1:]  # exclude the first element which is the sample itself
 
@@ -214,7 +232,7 @@ def solve_local_affine_coding(datum: jax.Array, knn: jax.Array) -> jax.Array:
     vector_b = jnp.array(object=[1.])  # scalar
 
     # declare the OSQP object
-    qp = OSQP(maxiter=1000, tol=1e-6)
+    qp = OSQP(maxiter=500, tol=1e-3)
     sol = qp.run(params_obj=(matrix_Q, vector_c), params_ineq=(matrix_G, vector_h), params_eq=(matrix_A, vector_b))
 
     x = sol.params.primal
@@ -248,7 +266,9 @@ def get_local_affine_coding(datum: jax.Array, knn_index: jax.Array, data: jax.Ar
     return solve_local_affine_coding(datum=datum, knn=knn)
 
 
-def get_batch_local_affine_coding(samples: np.ndarray, knn_indices: np.ndarray) -> jax.Array:
+def get_batch_local_affine_coding(
+        samples: jax.Array,
+        knn_indices: jax.Array) -> jax.Array:
     """This method calculates the local affine coding of a batch of samples
     The optimization is an operator-splitted quadratic program (OSQP):
     min 0.5 * x^T Q x + c^T x subject to Gx <= h, Ax = b.
@@ -260,14 +280,10 @@ def get_batch_local_affine_coding(samples: np.ndarray, knn_indices: np.ndarray) 
     Returns:
         x: the batch of coding vectors  # (N, K)
     """
-    # convert the matrix of nearest-neighbours to jax array
-    samples_jax = jnp.asarray(a=samples)  # (N, d)
-    knn_indices_jax = jnp.asarray(a=knn_indices)  # (N, K, d)
-
-    get_LAC_partial = partial(get_local_affine_coding, data=samples_jax)
+    get_LAC_partial = partial(get_local_affine_coding, data=samples)
     auto_batch_LAC = jax.vmap(fun=get_LAC_partial, in_axes=0, out_axes=0)
 
-    x = auto_batch_LAC(samples_jax, knn_indices_jax)  # (N, K)
+    x = auto_batch_LAC(samples, knn_indices)  # (N, K)
 
     return x
 

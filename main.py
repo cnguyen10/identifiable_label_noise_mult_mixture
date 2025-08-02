@@ -36,11 +36,13 @@ from utils import get_knn_indices, get_batch_local_affine_coding, EM_for_mm
 from utils import init_tx, initialize_dataloader
 from mixup import mixup_data
 
+from models.ResNet import ResNet, PreActResNet
+
 
 class FeatureEmbeddedModel(nnx.Module):
     def __init__(
         self,
-        feature_extractor: nnx.Module,
+        feature_extractor: ResNet | PreActResNet,
         num_classes: int,
         rngs: nnx.Rngs,
         dtype: jnp.dtype = jnp.float32
@@ -68,6 +70,38 @@ class FeatureEmbeddedModel(nnx.Module):
         return out
 
 
+def get_data_sources(
+    train_file: str,
+    test_file: str,
+    root: str
+) -> tuple[grain.RandomAccessDataSource, grain.RandomAccessDataSource]:
+    """load the data sources
+
+    Args:
+        train_file: path to the training json file
+        test_file: path to the testing json file
+        root: the root path to concatenate to the path of each sample in
+    those json files to load data
+
+    Returns:
+        source_train: data source for training
+        source_test: data source for testing
+    """
+    source_train = ImageDataSource(
+        annotation_file=train_file,
+        root=root,
+        idx_list=None
+    )
+
+    source_test = ImageDataSource(
+        annotation_file=test_file,
+        root=root,
+        idx_list=None
+    )
+
+    return (source_train, source_test)
+
+
 def extract_features(
     model: nnx.Module,
     dataloader: grain.DataLoader,
@@ -84,7 +118,7 @@ def extract_features(
         features_temp = model.get_features(x=x)
 
         features.append(features_temp)
-    
+
     features = jnp.concatenate(arrays=features, axis=0)
     return features
 
@@ -453,14 +487,14 @@ def get_nn_coding_matrix(
 
     # find K nearest-neighbours
     knn_indices = get_knn_indices(
-        xb=np.asarray(features),
+        xb=features,
         num_nn=cfg.hparams.num_nearest_neighbors,
         ids=sample_indices
     )
 
     # calculate coding mtrices
     coding_matrix = get_batch_local_affine_coding(
-        samples=jnp.astype(features, jnp.float32),
+        samples=features,
         knn_indices=knn_indices
     )
 
@@ -573,7 +607,7 @@ def main(cfg: DictConfig) -> None:
 
     model_2 = FeatureEmbeddedModel(
         feature_extractor=hydra.utils.instantiate(config=cfg.model)(
-            num_classes=cfg.pretrained.feature_dim,
+            num_classes=cfg.hparams.feature_dim,
             rngs=nnx.Rngs(jax.random.PRNGKey(seed=random.randint(a=0, b=100))),
             dropout_rate=cfg.training.dropout_rate,
             dtype=eval(cfg.jax.dtype)
@@ -676,7 +710,7 @@ def main(cfg: DictConfig) -> None:
             log_mult_prob_1 = checkpoint.model_2['log_mult_prob']
 
             del checkpoint
-            
+
         # region DATA LOADERS
         dataloader_train_fn = partial(
             initialize_dataloader,
@@ -724,7 +758,7 @@ def main(cfg: DictConfig) -> None:
             prefetch_size=cfg.data_loading.prefetch_size
         )
         # endregion
-        
+
         # region WARMUP
         if start_epoch_id == 0:
             for epoch_id in tqdm(
@@ -772,7 +806,8 @@ def main(cfg: DictConfig) -> None:
             colour='green',
             disable=not cfg.data_loading.progress_bar
         ):
-            if (epoch_id + 1) % cfg.hparams.relabeling_every_n_epochs == 0:
+            if (epoch_id + 1) % cfg.hparams.relabeling_every_n_epochs == 0 \
+                or epoch_id == 0:
                 idx_loader1 = (
                     grain.MapDataset.range(start=0, stop=cfg.dataset.length.train, step=1)
                         .shuffle(seed=random.randint(a=0, b=100_000))  # Shuffles globally.

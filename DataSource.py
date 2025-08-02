@@ -26,7 +26,7 @@ def load_json_file(json_file: str) -> list[dict[str, str]]:
 class ImageDataSource(grain.RandomAccessDataSource):
     def __init__(
             self,
-            annotation_file: list[str],
+            annotation_file: str,
             root: str | None = None,
             idx_list: list[int] | np.ndarray | None = None) -> None:
         """make the dataset from multiple annotation files.
@@ -35,7 +35,7 @@ class ImageDataSource(grain.RandomAccessDataSource):
         If one annotator does not label a sample, the label will be set to -1.
 
         Args:
-            annotation_files: path to the json files of annotation
+            annotation_file: path to the json files of annotation
             root: the directory to the dataset folder
             idx_list: only load samples according to this list of indices
 
