@@ -23,8 +23,14 @@ from transformations import (
 
 
 @partial(jax.jit, static_argnums=(2, 3))
-def batched_logmatmulexp_(logA: jax.Array, logB: jax.Array, num_rows_A: int, num_cols_B: int) -> jax.Array:
-    """Implement matrix multiplication in the log scale (see https://stackoverflow.com/a/74409968/5452342)
+def batched_logmatmulexp_(
+    logA: jax.Array,
+    logB: jax.Array,
+    num_rows_A:
+    int, num_cols_B: int
+) -> jax.Array:
+    """Implement matrix multiplication in the log scale
+    (see https://stackoverflow.com/a/74409968/5452342)
     Note: this implementation considers a batch of 2-d matrices.
 
     Args:
@@ -35,13 +41,22 @@ def batched_logmatmulexp_(logA: jax.Array, logB: jax.Array, num_rows_A: int, num
 
     Returns: log(AB)  # (n, k)
     """
-    logA_temp = jnp.tile(A=jnp.expand_dims(a=logA, axis=1), reps=(1, num_cols_B, 1, 1))  # (N, k, n, m)
+    logA_temp = jnp.tile(
+        A=jnp.expand_dims(a=logA, axis=1),
+        reps=(1, num_cols_B, 1, 1)
+    )  # (N, k, n, m)
     logA_temp = jnp.transpose(a=logA_temp, axes=(0, 2, 1, 3))  # (N, n, k, m)
 
-    logB_temp = jnp.tile(A=jnp.expand_dims(a=logB, axis=1), reps=(1, num_rows_A, 1, 1))  # (N, n, m, k)
+    logB_temp = jnp.tile(
+        A=jnp.expand_dims(a=logB, axis=1),
+        reps=(1, num_rows_A, 1, 1)
+    )  # (N, n, m, k)
     logB_temp = jnp.transpose(a=logB_temp, axes=(0, 1, 3, 2))  # (N, n, k, m)
 
-    logAB = jax.scipy.special.logsumexp(a=logA_temp + logB_temp, axis=-1)  # (N, n, k)
+    logAB = jax.scipy.special.logsumexp(
+        a=logA_temp + logB_temp,
+        axis=-1
+    )  # (N, n, k)
 
     return logAB
 
@@ -74,7 +89,8 @@ def EM_for_mm(
         y: an array of data (N, num_multinomial_samples, C)
         n_: the number of multinomial samples
         d_: the number of classes/categories in the multinomial distributions
-        num_noisy_labels_per_sample: the total number of trials in each multinomial sample
+            num_noisy_labels_per_sample: the total number of trials in each
+            multinomial sample
         num_em_iter:
         alpha: the Dirichlet prior parameter for mixture coefficients
         beta: the Dirichlet prior parameter for multinomial components
@@ -84,14 +100,27 @@ def EM_for_mm(
         log_mult_comps_probs:
     """
     # region initialize MIXTURE COEFFICIENTS and MULTINOMIAL COMPONENTS
-    mixture_coefficients = jnp.array(object=[[1/d_] * d_] * batch_size_)  # (N, C)
+    mixture_coefficients = jnp.array(
+        object=[[1/d_] * d_] * batch_size_
+    )  # (N, C)
 
-    mult_comps_probs = jnp.tile(A=jnp.eye(N=d_), reps=(batch_size_, 1, 1))  # (N, C)
+    mult_comps_probs = jnp.tile(
+        A=jnp.eye(N=d_),
+        reps=(batch_size_, 1, 1)
+    )  # (N, C)
 
     # add noise to multinomial probabilities
 
-    mult_comps_probs = 10 * mult_comps_probs + jax.random.uniform(key=key, shape=(batch_size_, d_, d_))  # (N, C, C)
-    mult_comps_probs = mult_comps_probs / jnp.sum(a=mult_comps_probs, axis=-1, keepdims=True)  # (N, C, C)
+    mult_comps_probs = 10 * mult_comps_probs \
+        + jax.random.uniform(
+            key=key,
+            shape=(batch_size_, d_, d_)
+        )  # (N, C, C)
+    mult_comps_probs /= jnp.sum(
+        a=mult_comps_probs,
+        axis=-1,
+        keepdims=True
+    )  # (N, C, C)
     # endregion
 
     # initialize a diagonal Dirichlet prior
@@ -112,18 +141,34 @@ def EM_for_mm(
         log_mult = multinomial_distributions.log_prob(
             value=jnp.expand_dims(a=y, axis=1)
         )  # (N, C, sample_shape)
-        log_mult = jnp.transpose(a=log_mult, axes=(0, 2, 1))  # (N, sample_shape, C)
+        log_mult = jnp.transpose(
+            a=log_mult,
+            axes=(0, 2, 1)
+        )  # (N, sample_shape, C)
 
         # E-step
-        log_gamma_num = jnp.expand_dims(a=log_mixture_coefficients, axis=1) + log_mult  # (N, sample_shape, C)
-        log_gamma_den = jax.scipy.special.logsumexp(a=log_gamma_num, axis=-1, keepdims=True)  # (N, sample_shape, 1)
+        log_gamma_num = jnp.expand_dims(a=log_mixture_coefficients, axis=1) \
+            + log_mult  # (N, sample_shape, C)
+        log_gamma_den = jax.scipy.special.logsumexp(
+            a=log_gamma_num,
+            axis=-1,
+            keepdims=True
+        )  # (N, sample_shape, 1)
         log_gamma = log_gamma_num - log_gamma_den  # (N, sample_shape, C)
 
-        log_sum_gamma = jax.scipy.special.logsumexp(a=log_gamma, axis=-2, keepdims=False)  # (N, C)
+        log_sum_gamma = jax.scipy.special.logsumexp(
+            a=log_gamma,
+            axis=-2,
+            keepdims=False
+        )  # (N, C)
 
         # M-step
-        log_mixture_coefficients_num = jnp.logaddexp(log_sum_gamma, log_alpha_m1)  # (N, C)
-        log_mixture_coefficients = log_mixture_coefficients_num - log_mixture_coefficients_den
+        log_mixture_coefficients_num = jnp.logaddexp(
+            log_sum_gamma,
+            log_alpha_m1
+        )  # (N, C)
+        log_mixture_coefficients = log_mixture_coefficients_num \
+            - log_mixture_coefficients_den
 
         log_gamma_y = batched_logmatmulexp_(
             logA=jnp.transpose(a=log_gamma, axes=(0, 2, 1)),
@@ -131,17 +176,28 @@ def EM_for_mm(
             num_rows_A=d_,
             num_cols_B=d_
         )  # (N, C, C)
-        log_mult_comps_probs_num = jnp.logaddexp(log_gamma_y, log_beta_m1)  # (N, C, C)
+        log_mult_comps_probs_num = jnp.logaddexp(
+            log_gamma_y,
+            log_beta_m1
+        )  # (N, C, C)
 
-        log_mult_comps_probs_den = jnp.log(num_noisy_labels_per_sample) + log_sum_gamma  # (N, C)
-        log_mult_comps_probs_den = jnp.logaddexp(log_mult_comps_probs_den, jnp.log(d_) + log_beta_m1)  # (N, C)
+        log_mult_comps_probs_den = jnp.log(num_noisy_labels_per_sample) \
+            + log_sum_gamma  # (N, C)
+        log_mult_comps_probs_den = jnp.logaddexp(
+            log_mult_comps_probs_den,
+            jnp.log(d_) + log_beta_m1
+        )  # (N, C)
 
-        log_mult_comps_probs = log_mult_comps_probs_num - jnp.expand_dims(a=log_mult_comps_probs_den, axis=-1)
+        log_mult_comps_probs = log_mult_comps_probs_num \
+            - jnp.expand_dims(a=log_mult_comps_probs_den, axis=-1)
 
     return log_mixture_coefficients, log_mult_comps_probs
 
 
-def sub_sparse_matrix_from_row_indices(mat: sparse.BCOO, indices: jax.Array, n_batch: int = 1) -> sparse.BCOO:
+def sub_sparse_matrix_from_row_indices(
+        mat: sparse.BCOO,
+        indices: jax.Array,
+        n_batch: int = 1) -> sparse.BCOO:
     """
     """
     m = mat[indices]
@@ -196,18 +252,19 @@ def get_knn_indices(
     # map the indices back to the original indices
     index_matrix = ids[index_matrix]
 
-    return index_matrix[:, 1:]  # exclude the first element which is the sample itself
+    return index_matrix[:, 1:]  # exclude the sample itself
 
 
 def solve_local_affine_coding(datum: jax.Array, knn: jax.Array) -> jax.Array:
-    """A JAX-jittable method to calculate the local affine coding of a single sample
-    from its nearest neighbours
+    """A JAX-jittable method to calculate the local affine coding of a single
+    sample from its nearest neighbours
     The optimization is an operator-splitted quadratic program (OSQP):
     min 0.5 * x^T Q x + c^T x subject to Gx <= h, Ax = b.
 
     Args:
         datum: the data vector of the sample  # (d,)
-        knn: the matrix where each row consists of K nearest-neighbour indices  # (K, d)
+        knn: the matrix where each row consists of K nearest-neighbour
+            indices  # (K, d)
 
     Returns:
         x: the coding vector
@@ -233,7 +290,11 @@ def solve_local_affine_coding(datum: jax.Array, knn: jax.Array) -> jax.Array:
 
     # declare the OSQP object
     qp = OSQP(maxiter=500, tol=1e-3)
-    sol = qp.run(params_obj=(matrix_Q, vector_c), params_ineq=(matrix_G, vector_h), params_eq=(matrix_A, vector_b))
+    sol = qp.run(
+        params_obj=(matrix_Q, vector_c),
+        params_ineq=(matrix_G, vector_h),
+        params_eq=(matrix_A, vector_b)
+    )
 
     x = sol.params.primal
 
@@ -246,9 +307,12 @@ def solve_local_affine_coding(datum: jax.Array, knn: jax.Array) -> jax.Array:
     return x
 
 
-def get_local_affine_coding(datum: jax.Array, knn_index: jax.Array, data: jax.Array) -> jax.Array:
-    """A JAX-based method to calculate the local affine coding of a single sample
-    from its nearest neighbours
+def get_local_affine_coding(
+        datum: jax.Array,
+        knn_index: jax.Array,
+        data: jax.Array) -> jax.Array:
+    """A JAX-based method to calculate the local affine coding of a single
+    sample from its nearest neighbours
     The optimization is an operator-splitted quadratic program (OSQP):
     min 0.5 * x^T Q x + c^T x subject to Gx <= h, Ax = b.
 
@@ -275,7 +339,8 @@ def get_batch_local_affine_coding(
 
     Args:
         samples: a batch of data vectors  # (N, d)
-        knn: the tensors of K nearest-neighbour of the batch of samples  # (N, K, d)
+        knn: the tensors of K nearest-neighbour of the batch
+            of samples  # (N, K, d)
 
     Returns:
         x: the batch of coding vectors  # (N, K)
@@ -316,11 +381,15 @@ def init_tx(
         alpha=0.001
     )
 
+    if clipped_norm is not None:
+        clip_or_identity = optax.clip_by_global_norm(max_norm=clipped_norm)
+    else:
+        clip_or_identity = optax.identity()
+
     # define an optimizer
     tx = optax.chain(
         l2_regularization,
-        optax.clip_by_global_norm(max_norm=clipped_norm) \
-            if clipped_norm is not None else optax.identity(),
+        clip_or_identity,
         optax.add_noise(eta=0.01, gamma=0.55, key=key),
         optax.sgd(learning_rate=lr_schedule_fn, momentum=momentum)
     )
@@ -360,7 +429,7 @@ def initialize_dataloader(
 
     if resize is not None:
         transformations.append(Resize(resize_shape=resize))
-    
+
     if padding_px is not None:
         transformations.append(CropAndPad(px=padding_px))
 
