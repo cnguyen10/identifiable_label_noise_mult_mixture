@@ -1,8 +1,8 @@
 dataset:
-  name: cifar10n
-  root: /sda2/datasets/cifar10n
-  num_classes: 10
-  train_file: ${dataset.root}/random_label1.json
+  name: cifar100
+  root: /sda2/datasets/cifar100/ciFAIR-100/
+  num_classes: 100
+  train_file: ${dataset.root}/part_dependence/label_noise_18_0.5.json
   test_file: ${dataset.root}/test.json
 
 data_augmentation:
@@ -30,9 +30,9 @@ hparams:
   feature_dim: 128
   num_samples_search_knn: 10000
   num_nearest_neighbors: 10
-  num_approx_classes: null
+  num_approx_classes: 10
   mu: 0.99
-  relabeling_every_n_epochs: 25
+  relabeling_every_n_epochs: 10
   batch_size_em: 100
   num_em_iter: 10
   num_multinomial_samples: 1000
