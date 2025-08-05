@@ -26,7 +26,6 @@ training:
   momentum: 0.9
   weight_decay: 0.0005
   dropout_rate: 0.1
-  eval_every_n_epochs: 10
   seed: 0
 
 mixup:
@@ -37,6 +36,6 @@ mixup:
 
 jax:
   platform: cuda
-  mem: 0.75  # percentage of VRAM in GPU will be allocated
+  mem: 0.5  # percentage of VRAM in GPU will be allocated
   jit: True
   dtype: jnp.bfloat16

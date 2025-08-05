@@ -332,7 +332,7 @@ def train_cross_entropy(
     model: nnx.Module,
     optimizer: nnx.Optimizer,
     dataloader: grain.DatasetIterator,
-    p_y: jax.Array,
+    log_p_y: jax.Array,
     cfg: DictConfig
 ) -> tuple[nnx.Module, nnx.Optimizer, jax.Array]:
     """train a model with cross-entropy loss
@@ -355,7 +355,14 @@ def train_cross_entropy(
         samples = next(dataloader)
 
         x = jnp.array(object=samples['image'], dtype=eval(cfg.jax.dtype))
-        y = p_y[samples['idx']]
+        y = log_p_y[samples['idx']]
+
+        if isinstance(log_p_y, sparse.BCOO):
+            y.data = jnp.exp(y.data)
+
+            y = y.todense()
+        else:
+            y = jnp.exp(y)
 
         if cfg.mixup.enable:
             key = jax.random.PRNGKey(seed=optimizer.step.value)
@@ -634,15 +641,20 @@ def relabel_data_sparse(
     This assumption enables the vectorization in the implementation.
 
     Args:
-        log_p_y: a row-wise matrix containing the "cleaner" label distributions of samples  (N , C)
-        log_mult_prob: a tensor containing the transition matrices of samples  (N, C, C)
-        nn_idx: a matrix where each row contains the indices of nearest-neighbours corresponding to row (sample) id  (N, K)
-        coding_matrix: a matrix where each row contains the coding coefficient (normalised similarity)  (N, K)
+        log_p_y: a row-wise matrix containing the "cleaner"
+            label distributions of samples  (N , C)
+        log_mult_prob: a tensor containing the transition matrices
+            of samples  (N, C, C)
+        nn_idx: a matrix where each row contains the indices of
+            nearest-neighbours corresponding to row (sample) id  (N, K)
+        coding_matrix: a matrix where each row contains
+            the coding coefficient (normalised similarity)  (N, K)
         args: contains configuration parameters
 
     Returns:
         p_y: a sparse matrix where each row is p(y | x)  # (N, C)
-        mult_prob: a sparse 3-d tensor where each matrix is p(yhat | x, y)  # (N, C , C)
+        mult_prob: a sparse 3-d tensor where each matrix is
+            p(yhat | x, y)  # (N, C , C)
     """
     # initialize new p(y | x) and p(yhat | x, y)
     log_p_y_new = dict(data=[], indices=[])
@@ -984,7 +996,7 @@ def main(cfg: DictConfig) -> None:
     logging.info(msg='Initialise directory to store logs')
     if not os.path.exists(path=cfg.experiment.logdir):
         logging.info(
-            msg=f'Logging folder not found. Make a logdir at {cfg.experiment.logdir}'
+            msg=f'Logging folder "{cfg.experiment.logdir}" not found.'
         )
         Path(cfg.experiment.logdir).mkdir(parents=True, exist_ok=True)
 
@@ -1001,19 +1013,17 @@ def main(cfg: DictConfig) -> None:
     )
 
     with mlflow.start_run(
-        run_id=cfg.experiment.run_id,
-        log_system_metrics=False
-    ) as mlflow_run, \
-    ocp.CheckpointManager(
-        directory=os.path.join(
-            os.getcwd(),
-            cfg.experiment.logdir,
-            cfg.experiment.name,
-            mlflow_run.info.run_id
-        ),
-        item_names=('data_1', 'data_2'),
-        options=ckpt_options
-    ) as ckpt_mngr:
+            run_id=cfg.experiment.run_id,
+            log_system_metrics=False) as mlflow_run, \
+        ocp.CheckpointManager(
+            directory=os.path.join(
+                os.getcwd(),
+                cfg.experiment.logdir,
+                cfg.experiment.name,
+                mlflow_run.info.run_id
+            ),
+            item_names=('data_1', 'data_2'),
+            options=ckpt_options) as ckpt_mngr:
 
         if cfg.experiment.run_id is None:
             start_epoch_id = 0
@@ -1123,7 +1133,7 @@ def main(cfg: DictConfig) -> None:
                     model=model_1,
                     optimizer=optimizer_1,
                     dataloader=iter_dataloader_train_1,
-                    p_y=jnp.exp(mult_mixture_2['log_p_y']) if not hasattr(mult_mixture_2['log_p_y'], 'todense') else jnp.exp(mult_mixture_2['log_p_y'].todense()),
+                    log_p_y=mult_mixture_2['log_p_y'],
                     cfg=cfg
                 )
 
@@ -1131,7 +1141,7 @@ def main(cfg: DictConfig) -> None:
                     model=model_2,
                     optimizer=optimizer_2,
                     dataloader=iter_dataloader_train_2,
-                    p_y=jnp.exp(mult_mixture_1['log_p_y']) if not hasattr(mult_mixture_1['log_p_y'], 'todense') else jnp.exp(mult_mixture_1['log_p_y'].todense()),
+                    log_p_y=mult_mixture_1['log_p_y'],
                     cfg=cfg
                 )
 
@@ -1269,7 +1279,7 @@ def main(cfg: DictConfig) -> None:
                 model=model_1,
                 optimizer=optimizer_1,
                 dataloader=iter_dataloader_train_1,
-                p_y=jnp.exp(mult_mixture_2['log_p_y']) if not hasattr(mult_mixture_2['log_p_y'], 'todense') else jnp.exp(mult_mixture_2['log_p_y'].todense()),
+                log_p_y=mult_mixture_2['log_p_y'],
                 cfg=cfg
             )
 
@@ -1277,7 +1287,7 @@ def main(cfg: DictConfig) -> None:
                 model=model_1,
                 optimizer=optimizer_2,
                 dataloader=iter_dataloader_train_2,
-                p_y=jnp.exp(mult_mixture_1['log_p_y']) if not hasattr(mult_mixture_1['log_p_y'], 'todense') else jnp.exp(mult_mixture_1['log_p_y'].todense()),
+                log_p_y=mult_mixture_1['log_p_y'],
                 cfg=cfg
             )
             # endregion
