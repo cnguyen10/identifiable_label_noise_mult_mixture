@@ -11,7 +11,6 @@ The code mainly relies on JAX - a composable machine learning framework develope
 - `grain` - a framework agnostic data loading
 - `albumentations` - a library for image augmentations (similar to `torchvision`)
 - `tensorflow-probability` - a library for probabilistic reasoning and statistical analysis
-- `faiss-gpu` - similarity search developed by Facebook AI
 - `jaxopt` - an optimisation in JAX
 - `hydra-core` - a library for configuration
 - `mlflow` - a library manage and track experiments.
@@ -20,7 +19,6 @@ Further details can be referred to the [requirements.txt](requirements.txt) incl
 
 **Do not install packages directly from `requirements.txt`**
 - For `jax`, please follow the instruction in its [installation guide](https://docs.jax.dev/en/latest/installation.html) to install the GPU version
-- For `faiss-gpu`, it is stopped to be published on https://pypi.org/project/. Please either compile from source or download its prebuilt wheel at https://github.com/kyamagu/faiss-wheels/releases/tag/v1.7.3 and install locally. **Note:** after installing `faiss-gpu`, please downgrade `numpy` to the version specified in `requirements.txt` because this version of `faiss-gpu` is pinned to `numpy` 1.x.
 
 ## Dataset structure
 A dataset has the following folder structure:
