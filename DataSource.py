@@ -44,7 +44,7 @@ class ImageDataSource(grain.RandomAccessDataSource):
         """
         self.root = root if root is not None else ''
         self._data = load_json_file(json_file=annotation_file)
-        
+
         if idx_list is not None:
             self._data = [self._data[sample_id] for sample_id in idx_list]
 

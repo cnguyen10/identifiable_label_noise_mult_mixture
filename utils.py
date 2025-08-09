@@ -74,7 +74,7 @@ def batched_logmatmulexp_(
     )
 )
 def EM_for_mm(
-    y: jax.Array,
+    approx_mm: tfp.distributions.MixtureSameFamily,
     batch_size_: int,
     n_: int,
     d_: int,
@@ -134,6 +134,15 @@ def EM_for_mm(
     log_mult_comps_probs = jnp.log(mult_comps_probs)
 
     for _ in range(num_em_iter):
+        key, _ = jax.random.split(key=key, num=2)
+
+        # generate samples
+        y = approx_mm.sample(
+            sample_shape=(n_,),
+            seed=key
+        )  # (sample_shape, N, C)
+        y = jnp.transpose(a=y, axes=(1, 0, 2))  # (N, sample_shape, C)
+
         multinomial_distributions = tfp.distributions.Multinomial(
             total_count=num_noisy_labels_per_sample,
             logits=jnp.expand_dims(a=log_mult_comps_probs, axis=-2)

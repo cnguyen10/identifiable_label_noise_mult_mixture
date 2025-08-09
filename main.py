@@ -28,6 +28,8 @@ import logging
 import hydra
 from omegaconf import DictConfig, OmegaConf
 
+from typing import Any
+
 from DataSource import ImageDataSource
 
 from utils import get_knn_indices, get_batch_local_affine_coding, EM_for_mm
@@ -128,8 +130,7 @@ def get_soft_noisy_labels(
     data_source: grain.RandomAccessDataSource,
     num_classes: int,
     seed: int | None = None,
-    progress_bar_flag: bool = True,
-    **kwargs
+    progress_bar_flag: bool = True
 ) -> dict[str, jax.Array]:
     """aggregate multiple noisy labels
     """
@@ -171,7 +172,6 @@ def get_soft_noisy_labels(
         p_y = p_y.at[i].set(values=noisy_labels_aggregate)
 
     p_y = optax.smooth_labels(labels=p_y, alpha=0.1)
-    log_p_y = jnp.log(p_y)
 
     log_mult_prob = jnp.eye(N=num_classes)  # (C, C)
     log_mult_prob = jnp.tile(
@@ -184,16 +184,14 @@ def get_soft_noisy_labels(
         + jax.random.uniform(key=key, shape=log_mult_prob.shape)
     log_mult_prob = jax.nn.log_softmax(x=log_mult_prob, axis=-1)
 
-    return dict(log_p_y=log_p_y, log_mult_prob=log_mult_prob)
+    return dict(p_y=p_y, log_mult_prob=log_mult_prob)
 
 
 def get_sparse_noisy_labels(
     data_source: grain.RandomAccessDataSource,
     num_classes: int,
-    # num_approx_classes: int,
-    seed: int | None = None,
     progress_bar_flag: bool = False
-) -> dict[str, jax.Array | sparse.BCOO]:
+) -> dict[str, Any]:
     """load the noisy labels as multinomial mixtures in the sparse setting
 
     Args:
@@ -203,98 +201,87 @@ def get_sparse_noisy_labels(
 
     Return:
         mult_mixture: a dictionary contains:
-            - log_p_y: logarithm of mixture coefficient or clean label dist.
+            - p_y: mixture coefficient or clean label dist.
             - log_mult_prob:
     """
     # initialise parameters of multinomial mixture model
     log_mult_prob = jnp.empty(
-        shape=(len(data_source), 1, num_classes),
+        shape=(len(data_source), num_classes),
         dtype=jnp.float32
     )
 
-    log_p_y_indices = []
-    # log_p_y_data = []
-
-    key = jax.random.key(
-        seed=seed if seed is not None else random.randint(a=0, b=1_000)
+    p_y = dict(
+        data=jnp.ones(shape=(len(data_source), 1)),
+        indices=jnp.empty(
+            shape=(len(data_source), 1),
+            dtype=jnp.int32
+        )
     )
 
-    for i in tqdm(
-        iterable=range(len(data_source)),
+    data_loader = (
+        grain.MapDataset.source(source=data_source)
+        .shuffle(seed=0)  # Shuffles globally.
+        .map(lambda x: (x['idx'], x['label']))  # Maps each element.
+        .batch(
+            batch_size=jnp.gcd(x1=len(data_source), x2=200).item()
+        )  # Batches consecutive elements.
+    )
+
+    for indices, labels in tqdm(
+        iterable=data_loader,
         desc='load noisy labels',
         leave=False,
-        ncols=79,
+        ncols=80,
         position=0,
         colour='green',
         disable=not progress_bar_flag
     ):
-        key, _ = jax.random.split(key=key, num=2)
-        # random_noise = 0.1 * jax.random.uniform(
-        #     key=key,
-        #     shape=(num_classes,)
-        # )
-        class_indices = data_source[i]['label']
-
-        # # convert integer numbers to one-hot vectors
-        # noisy_label = jax.nn.one_hot(
-        #     x=data_source[i]['label'],
-        #     num_classes=num_classes,
-        #     dtype=jnp.float32
-        # )  # (B, C)
-
-        # # randomly pick some classes (including the noisy label class)
-        # _, class_indices = jax.lax.top_k(
-        #     operand=noisy_label + random_noise,
-        #     k=num_approx_classes
-        # )  # (B, C0)
-
-        # # reduce from num_classes to num_approx_classes
-        # few_class_noisy_label = jnp.take_along_axis(
-        #     arr=noisy_label,
-        #     indices=class_indices,
-        #     axis=-1
-        # )
-
-        # # normalize to sum to 1
-        # few_class_noisy_label /= jnp.sum(a=few_class_noisy_label, axis=0)
-
-        # few_class_noisy_label = optax.smooth_labels(
-        #     labels=few_class_noisy_label,
-        #     alpha=0.1
-        # )
-
-        # log_p_y_data_temp = jnp.log(few_class_noisy_label)
-        log_p_y_indices.append(class_indices)
-        # log_p_y_data.append(log_p_y_data_temp)
+        # store the indices (or class id)
+        p_y['indices'] = (
+            p_y['indices']
+            .at[indices]
+            .set(values=labels[:, None])
+        )
 
         # log of multinomial probability vector
         log_mult_prob_temp = jnp.log(optax.smooth_labels(
             labels=jax.nn.one_hot(
-                x=class_indices,
+                x=labels,
                 num_classes=num_classes,
                 dtype=jnp.float32
             ),
             alpha=0.1
         ))
-        log_mult_prob = log_mult_prob.at[i].set(values=log_mult_prob_temp)
+        log_mult_prob = (
+            log_mult_prob
+            .at[indices]
+            .set(values=log_mult_prob_temp)
+        )
 
-    # log_p_y_data = jnp.stack(arrays=log_p_y_data, axis=0)  # (N, C0)
-    log_p_y_data = jnp.zeros(shape=(len(data_source), 1), dtype=jnp.float32)
-    log_p_y_indices = jnp.stack(
-        arrays=log_p_y_indices,
-        axis=0
-    )  # (N, C0)
+    return dict(p_y=p_y, log_mult_prob=log_mult_prob[:, None, :])
 
-    while (log_p_y_indices.ndim < 3):
-        log_p_y_indices = jnp.expand_dims(a=log_p_y_indices, axis=-1)
 
-    # sparse clean label distribution
-    log_p_y = sparse.BCOO(
-        args=(log_p_y_data, log_p_y_indices),
-        shape=(len(data_source), num_classes)
-    )  # (N, C)
+def p_y_sparse_to_dense(
+        data: jax.Array,  # (N, C0)
+        indices: jax.Array,  # (N, C0)
+        num_classes: int) -> jax.Array:
+    """
+    """
+    # construct the indices for BCOO
+    cols = jnp.expand_dims(a=indices, axis=-1)  # (N, C0, 1)
+    rows = jnp.broadcast_to(
+        array=jnp.expand_dims(a=jnp.arange(len(data)), axis=(-1, -2)),
+        shape=cols.shape
+    )
+    bcoo_indices = jnp.concatenate(arrays=(rows, cols), axis=-1)  # (N, C0, 2)
+    bcoo_indices = jnp.reshape(a=bcoo_indices, shape=(-1, 2))
 
-    return dict(log_p_y=log_p_y, log_mult_prob=log_mult_prob)
+    p_y_sparse = sparse.BCOO(
+        args=(data.flatten(), bcoo_indices),
+        shape=(len(data), num_classes)
+    )
+
+    return sparse.bcoo_todense(mat=p_y_sparse)
 
 
 @nnx.jit
@@ -338,7 +325,7 @@ def train_cross_entropy(
     model: nnx.Module,
     optimizer: nnx.Optimizer,
     dataloader: grain.DatasetIterator,
-    log_p_y: jax.Array,
+    p_y: jax.Array | dict[str, jax.Array],
     cfg: DictConfig
 ) -> tuple[nnx.Module, nnx.Optimizer, jax.Array]:
     """train a model with cross-entropy loss
@@ -361,14 +348,15 @@ def train_cross_entropy(
         samples = next(dataloader)
 
         x = jnp.array(object=samples['image'], dtype=eval(cfg.jax.dtype))
-        y = log_p_y[samples['idx']]
 
-        if isinstance(log_p_y, sparse.BCOO):
-            y.data = jnp.exp(y.data)
-
-            y = y.todense()
+        if isinstance(p_y, dict):
+            y = p_y_sparse_to_dense(
+                data=p_y['data'][samples['idx']],
+                indices=p_y['indices'][samples['idx']],
+                num_classes=cfg.dataset.num_classes
+            )
         else:
-            y = jnp.exp(y)
+            y = p_y[samples['idx']]
 
         if cfg.mixup.enable:
             key = jax.random.PRNGKey(seed=optimizer.step.value)
@@ -427,19 +415,19 @@ def evaluate(
     return acc_accum.compute()
 
 
-@partial(
-    jax.jit,
-    static_argnames=(
-        'num_noisy_labels_per_sample',
-        'num_multinomial_samples',
-        'num_classes',
-        'batch_size_em',
-        'num_em_iter',
-        'alpha',
-        'beta'
-    )
-)
-def _get_p_y(
+# @partial(
+#     jax.jit,
+#     static_argnames=(
+#         'num_noisy_labels_per_sample',
+#         'num_multinomial_samples',
+#         'num_classes',
+#         'batch_size_em',
+#         'num_em_iter',
+#         'alpha',
+#         'beta'
+#     )
+# )
+def get_p_y(
     log_mixture_coefficients: jax.Array,
     log_multinomial_probs: jax.Array,
     key: jax._src.prng.PRNGKeyArray,
@@ -467,15 +455,8 @@ def _get_p_y(
         components_distribution=component_distribution
     )
 
-    # generate noisy labels
-    yhat = mult_mixture.sample(
-        sample_shape=(num_multinomial_samples,),
-        seed=key
-    )  # (sample_shape, N, C)
-    yhat = jnp.transpose(a=yhat, axes=(1, 0, 2))  # (N, sample_shape, C)
-
     log_p_y, log_mult_prob = EM_for_mm(
-        y=yhat,
+        approx_mm=mult_mixture,
         batch_size_=batch_size_em,
         n_=num_multinomial_samples,
         d_=num_classes,
@@ -487,40 +468,6 @@ def _get_p_y(
     )
 
     return log_p_y, log_mult_prob
-
-
-def get_p_y(
-    log_mixture_coefficients: jax.Array,
-    log_multinomial_probs: jax.Array,
-    cfg: DictConfig
-) -> tuple[jax.Array, jax.Array]:
-    """Infer the noisy label distribution as a C-multinomial mixture model
-        using EM. The data is generated from a (K + 1)C-multinomial mixture
-        models obtained via nearest-neighbours
-
-    Args:
-        log_mixture_coefficients:
-        log_multinomial_probs: the probability matrix containing probability
-            vectors of (K + 1)C multinomial distributions
-        args: object storing configuration parameters
-
-    Returns:
-        log_p_y:
-        log_mult_prob: a matrix containing the probability vectors of
-            C-multinomial distributions
-    """
-    return _get_p_y(
-        log_mixture_coefficients=log_mixture_coefficients,
-        log_multinomial_probs=log_multinomial_probs,
-        key=jax.random.key(seed=random.randint(a=0, b=100_000)),
-        num_noisy_labels_per_sample=cfg.hparams.num_noisy_labels_per_sample,
-        num_multinomial_samples=cfg.hparams.num_multinomial_samples,
-        num_classes=cfg.dataset.num_classes,
-        batch_size_em=cfg.hparams.batch_size_em,
-        num_em_iter=cfg.hparams.num_em_iter,
-        alpha=cfg.hparams.alpha,
-        beta=cfg.hparams.beta
-    )
 
 
 def relabel_data(
@@ -552,21 +499,43 @@ def relabel_data(
             log_mult_prob: a sparse 3-d tensor where each matrix
                 is p(yhat | x, y)  # (N, C , C)
     """
-    log_p_y = mult_mixture['log_p_y']
+    log_p_y = jnp.log(mult_mixture['p_y'])
     log_mult_prob = mult_mixture['log_mult_prob']
 
     # initialize new p(y | x) and p(yhat | x, y)
     log_p_y_new = log_p_y + 0.
     log_mult_prob_new = log_mult_prob + 0.
 
+    seed = random.randint(a=0, b=100_000)
     data_loader = (
         grain.MapDataset.range(start=0, stop=len(log_p_y), step=1)
-        .shuffle(seed=random.randint(a=0, b=100_000))  # Shuffles globally.
+        .shuffle(seed=seed)  # Shuffles globally.
         .map(lambda x: x)  # Maps each element.
         .batch(
             batch_size=cfg.hparams.batch_size_em
         )  # Batches consecutive elements.
     )
+
+    key = jax.random.key(seed=seed)
+
+    def get_p_y_fn(
+            log_mixture: jax.Array,
+            log_components: jax.Array,
+            key: jax.typing.ArrayLike) -> tuple[jax.Array, jax.Array]:
+        return get_p_y(
+            log_mixture_coefficients=log_mixture,
+            log_multinomial_probs=log_components,
+            key=key,
+            num_noisy_labels_per_sample=cfg.hparams.num_noisy_labels_per_sample,
+            num_multinomial_samples=cfg.hparams.num_multinomial_samples,
+            num_classes=cfg.dataset.num_classes,
+            batch_size_em=cfg.hparams.batch_size_em,
+            num_em_iter=cfg.hparams.num_em_iter,
+            alpha=cfg.hparams.alpha,
+            beta=cfg.hparams.beta
+        )
+
+    get_p_y_jit = jax.jit(get_p_y_fn)
 
     for indices in tqdm(
         iterable=data_loader,
@@ -578,6 +547,8 @@ def relabel_data(
         position=1,
         disable=not cfg.data_loading.progress_bar
     ):
+        key, _ = jax.random.split(key=key, num=2)
+
         # extract the corresponding noisy labels
         log_p_y_ = log_p_y[indices]  # (B, C)
         log_mult_prob_ = log_mult_prob[indices]  # (B, C, C)
@@ -617,10 +588,10 @@ def relabel_data(
         # endregion
 
         # predict the clean label distribution using EM
-        log_p_y_temp, log_mult_prob_temp = get_p_y(
-            log_mixture_coefficients=log_mixture_coefficient,
-            log_multinomial_probs=log_multinomial_probs,
-            cfg=cfg
+        log_p_y_temp, log_mult_prob_temp = get_p_y_jit(
+            log_mixture_coefficient,
+            log_multinomial_probs,
+            key
         )
 
         # if jnp.any(a=jnp.isnan(log_p_y_temp)):
@@ -633,14 +604,14 @@ def relabel_data(
             .set(values=log_mult_prob_temp)
         )
 
-    return dict(log_p_y=log_p_y_new, log_mult_prob=log_mult_prob_new)
+    return dict(p_y=jnp.exp(log_p_y_new), log_mult_prob=log_mult_prob_new)
 
 
 def relabel_data_sparse(
-        mult_mixture: dict[str, sparse.BCOO | jax.Array],
+        mult_mixture: dict[str, Any],
         nn_idx: jax.Array,
         coding_matrix: jax.Array,
-        cfg: DictConfig) -> dict[str, sparse.BCOO | jax.Array]:
+        cfg: DictConfig) -> dict[str, Any]:
     """Perform EM to infer the p(y | x) and p(yhat | x, y)
     In this implementation, both p(y | x) and p(yhat | x, y) are sparse tensors
     and assumed that their dense dimensions are the same across all samples.
@@ -663,7 +634,16 @@ def relabel_data_sparse(
             p(yhat | x, y)  # (N, C , C)
     """
     # initialize new p(y | x) and p(yhat | x, y)
-    log_p_y_new = dict(data=[], indices=[])
+    p_y_new = dict(
+        data=jnp.empty(
+            shape=(len(nn_idx), cfg.hparams.num_approx_classes),
+            dtype=jnp.float32
+        ),
+        indices=jnp.empty(
+            shape=(len(nn_idx), cfg.hparams.num_approx_classes),
+            dtype=jnp.int32
+        )
+    )
     log_mult_prob_new = jnp.empty(
         shape=(
             len(nn_idx),
@@ -673,14 +653,36 @@ def relabel_data_sparse(
         dtype=jnp.float32
     )
 
+    seed = random.randint(a=0, b=1_000)
     data_loader = (
         grain.MapDataset.range(start=0, stop=len(nn_idx), step=1)
-        .shuffle(seed=random.randint(a=0, b=100_000))  # Shuffles globally.
+        .shuffle(seed=seed)  # Shuffles globally.
         .map(lambda x: x)  # Maps each element.
         .batch(
             batch_size=cfg.hparams.batch_size_em
         )  # Batches consecutive elements.
     )
+
+    key = jax.random.key(seed=seed)
+
+    def get_p_y_fn(
+            log_mixture: jax.Array,
+            log_components: jax.Array,
+            key: jax.typing.ArrayLike) -> tuple[jax.Array, jax.Array]:
+        return get_p_y(
+            log_mixture_coefficients=log_mixture,
+            log_multinomial_probs=log_components,
+            key=key,
+            num_noisy_labels_per_sample=cfg.hparams.num_noisy_labels_per_sample,
+            num_multinomial_samples=cfg.hparams.num_multinomial_samples,
+            num_classes=cfg.dataset.num_classes,
+            batch_size_em=cfg.hparams.batch_size_em,
+            num_em_iter=cfg.hparams.num_em_iter,
+            alpha=cfg.hparams.alpha,
+            beta=cfg.hparams.beta
+        )
+    
+    get_p_y_jit = jax.jit(get_p_y_fn)
 
     for indices in tqdm(
         iterable=data_loader,
@@ -692,36 +694,23 @@ def relabel_data_sparse(
         position=1,
         disable=not cfg.data_loading.progress_bar
     ):
+        key, _ = jax.random.split(key=key, num=2)
+
         # extract the corresponding noisy labels
-        log_p_y_ = sparse.BCOO(
-            args=(
-                mult_mixture['log_p_y'].data[indices],
-                mult_mixture['log_p_y'].indices[indices]
-            ),
-            shape=(indices.size, cfg.dataset.num_classes)
-        )  # (B, C)
+        p_y_batch = mult_mixture['p_y']['data'][indices]  # (B, C0)
 
         log_mult_prob_ = mult_mixture['log_mult_prob'][indices]  # (B, C0, C)
 
         # extract coding coefficients
-        log_nn_coding = jnp.log(coding_matrix[indices])  # (B, K)
+        nn_coding = coding_matrix[indices]  # (B, K)
 
         # region APPROXIMATE p(y | x) through nearest-neighbours
         nn_idx_ = nn_idx[indices]  # (B, K)
 
-        log_p_y_nn = sparse.BCOO(
-            args=(
-                mult_mixture['log_p_y'].data[nn_idx_],
-                mult_mixture['log_p_y'].indices[nn_idx_]
-            ),
-            shape=(
-                indices.size,
-                cfg.hparams.num_nearest_neighbors,
-                cfg.dataset.num_classes
-            )
-        )  # (B, K, C)
+        p_y_nn = mult_mixture['p_y']['data'][nn_idx_]  # (B, K, C0)
 
-        log_mult_prob_nn = mult_mixture['log_mult_prob'][nn_idx_]  # (B, K, C0, C)
+        # get the mult components of shape (B, K, C0, C)
+        log_mult_prob_nn = mult_mixture['log_mult_prob'][nn_idx_]
         log_mult_prob_nn = jnp.reshape(
             a=log_mult_prob_nn,
             shape=(
@@ -731,55 +720,22 @@ def relabel_data_sparse(
             )
         )  # (B, K*C0, C)
 
-        # calculate the mixture coefficients of other mixtures
-        # induced by nearest-neighbours
-        log_nn_coding_broadcast = jnp.broadcast_to(
-            array=log_nn_coding[:, :, None],
-            shape=log_p_y_nn.shape
-        )  # (B, K, C)
-        log_nn_coding_broadcast = log_nn_coding_broadcast \
-            + jnp.log(1 - cfg.hparams.mu)  # (B, K, C)
-        log_nn_coding_sparse = sparse.bcoo_extract(
-            sparr=log_p_y_nn, arr=log_nn_coding_broadcast
-        )
-
-        # mixture coefficients of NN samples
-        log_mixture_coefficient_nn = sparse.BCOO(
-            args=(
-                log_nn_coding_sparse.data + log_p_y_nn.data,
-                log_p_y_nn.indices
-            ),
-            shape=log_p_y_nn.shape
-        )  # (B, K, C)
-
-        # update n_batch to 1 in order to reshape
-        log_mixture_coefficient_nn = sparse.bcoo_update_layout(
-            mat=log_mixture_coefficient_nn,
-            n_batch=1
-        )
-
-        # flatten the last dimension/axis
-        log_mixture_coefficient_nn = sparse.bcoo_reshape(
-            mat=log_mixture_coefficient_nn,
-            new_sizes=(
-                log_mixture_coefficient_nn.shape[0],
-                log_mixture_coefficient_nn[0].size
-            )
-        )  # (B, K*C)
+        # coefficient of neighbor samples (B, K, C0)
+        mixture_coefficient_nn = (1 - cfg.hparams.mu) \
+            * nn_coding[:, :, None] \
+            * p_y_nn
+        mixture_coefficient_nn = jnp.reshape(
+            a=mixture_coefficient_nn,
+            shape=(len(indices), -1)
+        )  # (B, K*C0)
 
         # mixture coefficient of samples of interest
-        log_mixture_coefficient_x = sparse.BCOO(
-            args=(jnp.log(cfg.hparams.mu) + log_p_y_.data, log_p_y_.indices),
-            shape=log_p_y_.shape
-        )  # (B, C)
+        mixture_coefficient_x = cfg.hparams.mu * p_y_batch  # (B, C0)
 
-        # mixture coefficient used in the approximation of label distribution
-        log_mixture_coefficient_sparse = sparse.bcoo_concatenate(
-            operands=(log_mixture_coefficient_x, log_mixture_coefficient_nn),
-            dimension=1
-        )  # (B, (K + 1) * C)
-
-        log_mixture_coefficient = log_mixture_coefficient_sparse.data  # (B, (K + 1) * C0)
+        mixture_coefficient = jnp.concatenate(
+            arrays=(mixture_coefficient_x, mixture_coefficient_nn),
+            axis=-1
+        )  # (B, (K + 1) * C0)
 
         log_multinomial_probs = jnp.concatenate(
             arrays=(log_mult_prob_, log_mult_prob_nn),
@@ -788,41 +744,44 @@ def relabel_data_sparse(
         # endregion
 
         # predict the clean label distribution using EM
-        log_p_y_temp, log_mult_prob_temp = get_p_y(
-            log_mixture_coefficients=log_mixture_coefficient,
-            log_multinomial_probs=log_multinomial_probs,
-            cfg=cfg
+        log_p_y_temp, log_mult_prob_temp = get_p_y_jit(
+            jnp.log(mixture_coefficient),
+            log_multinomial_probs,
+            key
         )
+
+        p_y_temp = jnp.exp(log_p_y_temp)
 
         # if jnp.any(a=jnp.isnan(log_p_y_temp)):
         #     raise ValueError('NaN is detected after running EM')
 
         # region TRUNCATE the result
         top_k_data, top_k_indices = jax.lax.top_k(
-            operand=log_p_y_temp,
+            operand=p_y_temp,
             k=cfg.hparams.num_approx_classes
         )  # (B, C0)
 
-        # truncate the mixture vector
-        # normalise top_k_data
-        top_k_data = jax.nn.log_softmax(x=top_k_data, axis=-1)  # (B, C0)
+        # truncate the mixture vector and normalise top_k_data
+        top_k_data /= jnp.sum(a=top_k_data, axis=-1, keepdims=True)  # (B, C0)
 
         # append data and corresponding indices
-        log_p_y_new['data'].append(top_k_data.flatten())
-
-        id_rows = jnp.broadcast_to(
-            array=indices[:, None],
-            shape=top_k_indices.shape
+        p_y_new['data'] = (
+            p_y_new['data']
+            .at[indices]
+            .set(values=top_k_data)
         )
-        log_p_y_new['indices'].append(
-            jnp.stack(
-                arrays=(id_rows.flatten(), top_k_indices.flatten()),
-                axis=-1
-            )
+
+        p_y_new['indices'] = (
+            p_y_new['indices']
+            .at[indices]
+            .set(values=top_k_indices)
         )
 
         # truncate the multinominal components
-        log_mult_prob_truncated = log_mult_prob_temp[jnp.arange(indices.size)[:, None], top_k_indices]
+        log_mult_prob_truncated = log_mult_prob_temp[
+            jnp.arange(indices.size)[:, None],
+            top_k_indices
+        ]
         # endregion
 
         # update the noisy labels
@@ -830,15 +789,7 @@ def relabel_data_sparse(
             values=log_mult_prob_truncated
         )
 
-    log_p_y_new = sparse.BCOO(
-        args=(
-            jnp.concatenate(arrays=log_p_y_new['data'], axis=0),
-            jnp.concatenate(arrays=log_p_y_new['indices'], axis=0)
-        ),
-        shape=mult_mixture['log_p_y'].shape
-    )
-
-    return dict(log_p_y=log_p_y_new, log_mult_prob=log_mult_prob_new)
+    return dict(p_y=p_y_new, log_mult_prob=log_mult_prob_new)
 
 
 def get_nn_coding_matrix(
@@ -999,7 +950,6 @@ def main(cfg: DictConfig) -> None:
     mult_mixture_1 = get_noisy_labels_fn(
         data_source=source_train,
         num_classes=cfg.dataset.num_classes,
-        seed=cfg.training.seed,
         progress_bar_flag=cfg.data_loading.progress_bar
     )
     mult_mixture_2 = {key: mult_mixture_1[key] for key in mult_mixture_1}
@@ -1136,7 +1086,7 @@ def main(cfg: DictConfig) -> None:
         if start_epoch_id == 0:
             for epoch_id in tqdm(
                 iterable=range(cfg.training.num_epochs_warmup),
-                desc='Warmup',
+                desc='warmup',
                 ncols=80,
                 leave=True,
                 position=0,
@@ -1147,7 +1097,7 @@ def main(cfg: DictConfig) -> None:
                     model=model_1,
                     optimizer=optimizer_1,
                     dataloader=iter_dataloader_train_1,
-                    log_p_y=mult_mixture_2['log_p_y'],
+                    p_y=mult_mixture_2['p_y'],
                     cfg=cfg
                 )
 
@@ -1155,7 +1105,7 @@ def main(cfg: DictConfig) -> None:
                     model=model_2,
                     optimizer=optimizer_2,
                     dataloader=iter_dataloader_train_2,
-                    log_p_y=mult_mixture_1['log_p_y'],
+                    p_y=mult_mixture_1['p_y'],
                     cfg=cfg
                 )
 
@@ -1192,7 +1142,9 @@ def main(cfg: DictConfig) -> None:
             colour='green',
             disable=not cfg.data_loading.progress_bar
         ):
-            if (epoch_id + 1) % cfg.hparams.relabeling_every_n_epochs == 0 or epoch_id == 0:
+            if (epoch_id + 1) % cfg.hparams.relabeling_every_n_epochs == 0 \
+                or epoch_id == 0:
+
                 idx_loader1 = (
                     grain.MapDataset.range(
                         start=0,
@@ -1306,15 +1258,15 @@ def main(cfg: DictConfig) -> None:
                 model=model_1,
                 optimizer=optimizer_1,
                 dataloader=iter_dataloader_train_1,
-                log_p_y=mult_mixture_2['log_p_y'],
+                p_y=mult_mixture_2['p_y'],
                 cfg=cfg
             )
 
             model_2, optimizer_2, loss_2 = train_cross_entropy(
-                model=model_1,
+                model=model_2,
                 optimizer=optimizer_2,
                 dataloader=iter_dataloader_train_2,
-                log_p_y=mult_mixture_1['log_p_y'],
+                p_y=mult_mixture_1['p_y'],
                 cfg=cfg
             )
             # endregion
