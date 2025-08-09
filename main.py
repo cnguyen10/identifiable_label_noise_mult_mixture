@@ -1,6 +1,7 @@
 import jax
 import jax.numpy as jnp
 from jax.experimental import sparse
+from jax.sharding import PartitionSpec, NamedSharding
 
 import flax.nnx as nnx
 from flax.traverse_util import flatten_dict
@@ -514,8 +515,6 @@ def relabel_data(
         alpha=cfg.hparams.alpha,
         beta=cfg.hparams.beta
     )
-    
-    get_p_y_jit = jax.jit(get_p_y_fn)
 
     for indices in tqdm(
         iterable=data_loader,
@@ -568,7 +567,7 @@ def relabel_data(
         # endregion
 
         # predict the clean label distribution using EM
-        log_p_y_temp, log_mult_prob_temp = get_p_y_jit(
+        log_p_y_temp, log_mult_prob_temp = get_p_y_fn(
             log_mixture_coefficient,
             log_multinomial_probs,
             key
@@ -656,11 +655,16 @@ def relabel_data_sparse(
         alpha=cfg.hparams.alpha,
         beta=cfg.hparams.beta
     )
-    
-    get_p_y_jit = jax.jit(get_p_y_fn)
 
+    # region SHARDING
     if num_devices > 1:
-        get_p_y_pmap = jax.pmap(get_p_y_fn)
+        # Create a Sharding object to distribute a value across devices:
+        mesh = jax.make_mesh(
+            axis_shapes=(num_devices,),
+            axis_names=('x',)
+        )
+    
+    # endergion
 
     for indices in tqdm(
         iterable=data_loader,
@@ -722,39 +726,20 @@ def relabel_data_sparse(
 
         # predict the clean label distribution using EM
         if (num_devices > 1) and (len(indices) % num_devices == 0):
-            mixture_coefficient = jnp.reshape(
-                a=mixture_coefficient,
-                shape=(num_devices, int(len(indices) / num_devices), -1)
+            mixture_coefficient = jax.device_put(
+                x=mixture_coefficient,
+                device=NamedSharding(mesh=mesh, spec=PartitionSpec('x'))
             )
-            log_multinomial_probs = jnp.reshape(
-                a=log_multinomial_probs,
-                shape=(
-                    num_devices,
-                    int(len(indices) / jax.device_count()),
-                    -1,
-                    cfg.dataset.num_classes
-                )
+            log_multinomial_probs = jax.device_put(
+                x=log_multinomial_probs,
+                device=NamedSharding(mesh=mesh, spec=PartitionSpec('x'))
             )
 
-            log_p_y_temp, log_mult_prob_temp = get_p_y_pmap(
-                jnp.log(mixture_coefficient),
-                log_multinomial_probs,
-                jax.random.split(key=key, num=num_devices)
-            )
-            log_p_y_temp = jnp.reshape(
-                a=log_p_y_temp,
-                shape=(len(indices), cfg.dataset.num_classes)
-            )
-            log_mult_prob_temp = jnp.reshape(
-                a=log_mult_prob_temp,
-                shape=(len(indices), cfg.dataset.num_classes, cfg.dataset.num_classes)
-            )
-        else:
-            log_p_y_temp, log_mult_prob_temp = get_p_y_jit(
-                jnp.log(mixture_coefficient),
-                log_multinomial_probs,
-                key
-            )
+        log_p_y_temp, log_mult_prob_temp = get_p_y_fn(
+            jnp.log(mixture_coefficient),
+            log_multinomial_probs,
+            key
+        )
 
         p_y_temp = jnp.exp(log_p_y_temp)
 
