@@ -64,7 +64,6 @@ def batched_logmatmulexp_(
 @partial(
     jax.jit,
     static_argnames=(
-        'batch_size_',
         'n_',
         'd_',
         'num_noisy_labels_per_sample',
@@ -75,7 +74,6 @@ def batched_logmatmulexp_(
 )
 def EM_for_mm(
     approx_mm: tfp.distributions.MixtureSameFamily,
-    batch_size_: int,
     n_: int,
     d_: int,
     num_noisy_labels_per_sample: int,
@@ -99,6 +97,8 @@ def EM_for_mm(
         log_mixture_coefficients:
         log_mult_comps_probs:
     """
+    batch_size_ = len(approx_mm.mixture_distribution.logits)
+
     # region initialize MIXTURE COEFFICIENTS and MULTINOMIAL COMPONENTS
     mixture_coefficients = jnp.array(
         object=[[1/d_] * d_] * batch_size_

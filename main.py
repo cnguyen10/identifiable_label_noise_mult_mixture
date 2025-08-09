@@ -415,18 +415,7 @@ def evaluate(
     return acc_accum.compute()
 
 
-# @partial(
-#     jax.jit,
-#     static_argnames=(
-#         'num_noisy_labels_per_sample',
-#         'num_multinomial_samples',
-#         'num_classes',
-#         'batch_size_em',
-#         'num_em_iter',
-#         'alpha',
-#         'beta'
-#     )
-# )
+
 def get_p_y(
     log_mixture_coefficients: jax.Array,
     log_multinomial_probs: jax.Array,
@@ -434,7 +423,6 @@ def get_p_y(
     num_noisy_labels_per_sample: int,
     num_multinomial_samples: int,
     num_classes: int,
-    batch_size_em: int,
     num_em_iter: int,
     alpha: float,
     beta: float
@@ -457,7 +445,6 @@ def get_p_y(
 
     log_p_y, log_mult_prob = EM_for_mm(
         approx_mm=mult_mixture,
-        batch_size_=batch_size_em,
         n_=num_multinomial_samples,
         d_=num_classes,
         num_noisy_labels_per_sample=num_noisy_labels_per_sample,
@@ -518,23 +505,16 @@ def relabel_data(
 
     key = jax.random.key(seed=seed)
 
-    def get_p_y_fn(
-            log_mixture: jax.Array,
-            log_components: jax.Array,
-            key: jax.typing.ArrayLike) -> tuple[jax.Array, jax.Array]:
-        return get_p_y(
-            log_mixture_coefficients=log_mixture,
-            log_multinomial_probs=log_components,
-            key=key,
-            num_noisy_labels_per_sample=cfg.hparams.num_noisy_labels_per_sample,
-            num_multinomial_samples=cfg.hparams.num_multinomial_samples,
-            num_classes=cfg.dataset.num_classes,
-            batch_size_em=cfg.hparams.batch_size_em,
-            num_em_iter=cfg.hparams.num_em_iter,
-            alpha=cfg.hparams.alpha,
-            beta=cfg.hparams.beta
-        )
-
+    get_p_y_fn = partial(
+        get_p_y,
+        num_noisy_labels_per_sample=cfg.hparams.num_noisy_labels_per_sample,
+        num_multinomial_samples=cfg.hparams.num_multinomial_samples,
+        num_classes=cfg.dataset.num_classes,
+        num_em_iter=cfg.hparams.num_em_iter,
+        alpha=cfg.hparams.alpha,
+        beta=cfg.hparams.beta
+    )
+    
     get_p_y_jit = jax.jit(get_p_y_fn)
 
     for indices in tqdm(
@@ -677,19 +657,10 @@ def relabel_data_sparse(
         beta=cfg.hparams.beta
     )
     
-    get_p_y_jit = jax.jit(partial(
-        get_p_y_fn,
-        batch_size_em=cfg.hparams.batch_size_em
-    ))
+    get_p_y_jit = jax.jit(get_p_y_fn)
 
     if num_devices > 1:
-        get_p_y_pmap = jax.pmap(
-            partial(
-                get_p_y_fn,
-                batch_size_em=cfg.hparams.batch_size_em // num_devices
-            ),
-            donate_argnums=(0, 1)
-        )
+        get_p_y_pmap = jax.pmap(get_p_y_fn)
 
     for indices in tqdm(
         iterable=data_loader,
