@@ -23,7 +23,7 @@ training:
   lr: 0.01
   batch_size: 128
   num_epochs: 300
-  num_epochs_warmup: 1
+  num_epochs_warmup: 30
   clipped_norm: 10
 
 hparams:

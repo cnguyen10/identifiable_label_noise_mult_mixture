@@ -487,6 +487,8 @@ def relabel_data(
             log_mult_prob: a sparse 3-d tensor where each matrix
                 is p(yhat | x, y)  # (N, C , C)
     """
+    num_devices = jax.device_count(backend='gpu')
+
     log_p_y = jnp.log(mult_mixture['p_y'])
     log_mult_prob = mult_mixture['log_mult_prob']
 
@@ -515,6 +517,13 @@ def relabel_data(
         alpha=cfg.hparams.alpha,
         beta=cfg.hparams.beta
     )
+
+    if num_devices > 1:
+        # Create a Sharding object to distribute a value across devices:
+        mesh = jax.make_mesh(
+            axis_shapes=(num_devices,),
+            axis_names=('x',)
+        )
 
     for indices in tqdm(
         iterable=data_loader,
@@ -565,6 +574,17 @@ def relabel_data(
             axis=1
         )  # (B, (K + 1) * C, C)
         # endregion
+
+        # distributed computation
+        if (num_devices > 1) and (len(indices) % num_devices == 0):
+            log_mixture_coefficient = jax.device_put(
+                x=log_mixture_coefficient,
+                device=NamedSharding(mesh=mesh, spec=PartitionSpec('x'))
+            )
+            log_multinomial_probs = jax.device_put(
+                x=log_multinomial_probs,
+                device=NamedSharding(mesh=mesh, spec=PartitionSpec('x'))
+            )
 
         # predict the clean label distribution using EM
         log_p_y_temp, log_mult_prob_temp = get_p_y_fn(
@@ -724,7 +744,7 @@ def relabel_data_sparse(
         )  # (B, (K + 1) * C0, C)
         # endregion
 
-        # predict the clean label distribution using EM
+        # distributed computation
         if (num_devices > 1) and (len(indices) % num_devices == 0):
             mixture_coefficient = jax.device_put(
                 x=mixture_coefficient,
@@ -735,6 +755,7 @@ def relabel_data_sparse(
                 device=NamedSharding(mesh=mesh, spec=PartitionSpec('x'))
             )
 
+        # predict the clean label distribution using EM
         log_p_y_temp, log_mult_prob_temp = get_p_y_fn(
             jnp.log(mixture_coefficient),
             log_multinomial_probs,
@@ -840,6 +861,11 @@ def get_nn_coding_matrix(
 def main(cfg: DictConfig) -> None:
     """Main function
     """
+    logging.info('Identifiability in noisy label learning')
+    logging.info(f'Dataset = {cfg.dataset.name}')
+    logging.info(f'Num classes = {cfg.dataset.num_classes}')
+    logging.info(f'Num approx classes = {cfg.hparams.num_approx_classes}')
+
     # region ENVIRONMENT
     jax.config.update('jax_disable_jit', not cfg.jax.jit)
     jax.config.update('jax_platforms', cfg.jax.platform)
@@ -1294,8 +1320,7 @@ def main(cfg: DictConfig) -> None:
                     'loss/model_1': loss_1,
                     'loss/model_2': loss_2,
                     'accuracy/model_1': acc_1,
-                    'accuracy/model_2': acc_2,
-                    'accuracy/average': 0.5 * (acc_1 + acc_2)
+                    'accuracy/model_2': acc_2
                 },
                 step=epoch_id + 1,
                 synchronous=False
