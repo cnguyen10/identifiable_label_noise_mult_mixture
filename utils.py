@@ -148,7 +148,7 @@ def EM_for_mm(
             logits=jnp.expand_dims(a=log_mult_comps_probs, axis=-2)
         )
         log_mult = multinomial_distributions.log_prob(
-            value=jnp.expand_dims(a=y, axis=1)
+            value=jnp.expand_dims(a=y, axis=-3)
         )  # (N, C, sample_shape)
         log_mult = jnp.transpose(
             a=log_mult,

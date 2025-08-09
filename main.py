@@ -633,6 +633,8 @@ def relabel_data_sparse(
         mult_prob: a sparse 3-d tensor where each matrix is
             p(yhat | x, y)  # (N, C , C)
     """
+    num_devices = jax.device_count(backend='gpu')
+
     # initialize new p(y | x) and p(yhat | x, y)
     p_y_new = dict(
         data=jnp.empty(
@@ -665,28 +667,32 @@ def relabel_data_sparse(
 
     key = jax.random.key(seed=seed)
 
-    def get_p_y_fn(
-            log_mixture: jax.Array,
-            log_components: jax.Array,
-            key: jax.typing.ArrayLike) -> tuple[jax.Array, jax.Array]:
-        return get_p_y(
-            log_mixture_coefficients=log_mixture,
-            log_multinomial_probs=log_components,
-            key=key,
-            num_noisy_labels_per_sample=cfg.hparams.num_noisy_labels_per_sample,
-            num_multinomial_samples=cfg.hparams.num_multinomial_samples,
-            num_classes=cfg.dataset.num_classes,
-            batch_size_em=cfg.hparams.batch_size_em,
-            num_em_iter=cfg.hparams.num_em_iter,
-            alpha=cfg.hparams.alpha,
-            beta=cfg.hparams.beta
-        )
+    get_p_y_fn = partial(
+        get_p_y,
+        num_noisy_labels_per_sample=cfg.hparams.num_noisy_labels_per_sample,
+        num_multinomial_samples=cfg.hparams.num_multinomial_samples,
+        num_classes=cfg.dataset.num_classes,
+        num_em_iter=cfg.hparams.num_em_iter,
+        alpha=cfg.hparams.alpha,
+        beta=cfg.hparams.beta
+    )
     
-    get_p_y_jit = jax.jit(get_p_y_fn)
+    get_p_y_jit = jax.jit(partial(
+        get_p_y_fn,
+        batch_size_em=cfg.hparams.batch_size_em
+    ))
+
+    if num_devices > 1:
+        get_p_y_pmap = jax.pmap(
+            partial(
+                get_p_y_fn,
+                batch_size_em=cfg.hparams.batch_size_em // num_devices
+            ),
+            donate_argnums=(0, 1)
+        )
 
     for indices in tqdm(
         iterable=data_loader,
-        total=len(nn_idx) // cfg.hparams.batch_size_em,
         desc=' re-label',
         leave=False,
         ncols=80,
@@ -744,11 +750,40 @@ def relabel_data_sparse(
         # endregion
 
         # predict the clean label distribution using EM
-        log_p_y_temp, log_mult_prob_temp = get_p_y_jit(
-            jnp.log(mixture_coefficient),
-            log_multinomial_probs,
-            key
-        )
+        if (num_devices > 1) and (len(indices) % num_devices == 0):
+            mixture_coefficient = jnp.reshape(
+                a=mixture_coefficient,
+                shape=(num_devices, int(len(indices) / num_devices), -1)
+            )
+            log_multinomial_probs = jnp.reshape(
+                a=log_multinomial_probs,
+                shape=(
+                    num_devices,
+                    int(len(indices) / jax.device_count()),
+                    -1,
+                    cfg.dataset.num_classes
+                )
+            )
+
+            log_p_y_temp, log_mult_prob_temp = get_p_y_pmap(
+                jnp.log(mixture_coefficient),
+                log_multinomial_probs,
+                jax.random.split(key=key, num=num_devices)
+            )
+            log_p_y_temp = jnp.reshape(
+                a=log_p_y_temp,
+                shape=(len(indices), cfg.dataset.num_classes)
+            )
+            log_mult_prob_temp = jnp.reshape(
+                a=log_mult_prob_temp,
+                shape=(len(indices), cfg.dataset.num_classes, cfg.dataset.num_classes)
+            )
+        else:
+            log_p_y_temp, log_mult_prob_temp = get_p_y_jit(
+                jnp.log(mixture_coefficient),
+                log_multinomial_probs,
+                key
+            )
 
         p_y_temp = jnp.exp(log_p_y_temp)
 
