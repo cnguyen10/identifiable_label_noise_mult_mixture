@@ -522,7 +522,7 @@ def relabel_data(
         # Create a Sharding object to distribute a value across devices:
         mesh = jax.make_mesh(
             axis_shapes=(num_devices,),
-            axis_names=('x',)
+            axis_names=('batch',)
         )
 
     for indices in tqdm(
@@ -579,11 +579,11 @@ def relabel_data(
         if (num_devices > 1) and (len(indices) % num_devices == 0):
             log_mixture_coefficient = jax.device_put(
                 x=log_mixture_coefficient,
-                device=NamedSharding(mesh=mesh, spec=PartitionSpec('x'))
+                device=NamedSharding(mesh=mesh, spec=PartitionSpec('batch'))
             )
             log_multinomial_probs = jax.device_put(
                 x=log_multinomial_probs,
-                device=NamedSharding(mesh=mesh, spec=PartitionSpec('x'))
+                device=NamedSharding(mesh=mesh, spec=PartitionSpec('batch'))
             )
 
         # predict the clean label distribution using EM
@@ -681,7 +681,7 @@ def relabel_data_sparse(
         # Create a Sharding object to distribute a value across devices:
         mesh = jax.make_mesh(
             axis_shapes=(num_devices,),
-            axis_names=('x',)
+            axis_names=('batch',)
         )
     
     # endergion
@@ -748,11 +748,11 @@ def relabel_data_sparse(
         if (num_devices > 1) and (len(indices) % num_devices == 0):
             mixture_coefficient = jax.device_put(
                 x=mixture_coefficient,
-                device=NamedSharding(mesh=mesh, spec=PartitionSpec('x'))
+                device=NamedSharding(mesh=mesh, spec=PartitionSpec('batch'))
             )
             log_multinomial_probs = jax.device_put(
                 x=log_multinomial_probs,
-                device=NamedSharding(mesh=mesh, spec=PartitionSpec('x'))
+                device=NamedSharding(mesh=mesh, spec=PartitionSpec('batch'))
             )
 
         # predict the clean label distribution using EM
@@ -811,6 +811,8 @@ def get_nn_coding_matrix(
 ) -> tuple[jax.Array, jax.Array]:
     """
     """
+    num_devices = jax.device_count()
+
     sub_datasource = ImageDataSource(
         annotation_file=cfg.dataset.train_file,
         root=cfg.dataset.root,
@@ -841,6 +843,21 @@ def get_nn_coding_matrix(
         cfg=cfg
     )
 
+    # convert to f32
+    features = features.astype(dtype=jnp.float32)
+
+    if num_devices > 1:
+        # Create a Sharding object to distribute a value across devices:
+        mesh = jax.make_mesh(
+            axis_shapes=(num_devices,),
+            axis_names=('batch',)
+        )
+
+        features = jax.device_put(
+            x=features,
+            device=NamedSharding(mesh=mesh, spec=PartitionSpec('batch'))
+        )
+
     # find K nearest-neighbours
     knn_indices = get_knn_indices(
         xb=features,
@@ -850,7 +867,7 @@ def get_nn_coding_matrix(
 
     # calculate coding mtrices
     coding_matrix = get_batch_local_affine_coding(
-        samples=features.astype(dtype=jnp.float32),
+        samples=features,
         knn_indices=knn_indices
     )
 
@@ -869,6 +886,7 @@ def main(cfg: DictConfig) -> None:
     # region ENVIRONMENT
     jax.config.update('jax_disable_jit', not cfg.jax.jit)
     jax.config.update('jax_platforms', cfg.jax.platform)
+    jax.config.update('jax_default_device', jax.devices()[-1])
 
     os.environ['XLA_PYTHON_CLIENT_MEM_FRACTION'] = str(cfg.jax.mem)
     # endregion

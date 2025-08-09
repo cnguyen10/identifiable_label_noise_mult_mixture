@@ -264,6 +264,7 @@ def get_knn_indices(
     return index_matrix[:, 1:]  # exclude the sample itself
 
 
+@jax.jit
 def solve_local_affine_coding(datum: jax.Array, knn: jax.Array) -> jax.Array:
     """A JAX-jittable method to calculate the local affine coding of a single
     sample from its nearest neighbours

@@ -35,7 +35,7 @@ hparams:
   relabeling_every_n_epochs: 10
   batch_size_em: 100
   num_em_iter: 10
-  num_multinomial_samples: 1000
-  num_noisy_labels_per_sample: 19
+  num_multinomial_samples: 250
+  num_noisy_labels_per_sample: 2*${hparams.num_approx_classes} - 1
   alpha: 1.1  # Dirichlet prior for categorical distribution Pr(y | x)
   beta: 1.1  # Dirichlet prior for multinomial distribution
